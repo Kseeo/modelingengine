@@ -121,7 +121,9 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
          "--geometric-iters", str(cfg.densify_geometric_iters),
          # OpenMVS 자동 ROI 상자가 발보다 작게 잡혀 발끝이 잘리는 경우가 있어 자르지 않음
          # (대상 분리는 crop_to_focus가 담당). ROI 추정 자체는 이웃 뷰 선택 가중에 계속 쓰인다
-         "--crop-to-roi", "0")
+         "--crop-to-roi", "0",
+         # 희소점이 적으면 탑 형태로 오판해 tower 경로에서 접근 위반(0xC0000005)으로 죽는 경우가 있음 (test07)
+         "--tower-mode", "0")
     dense_ply = _output_mesh(dense_scene, ".ply")
     if cfg.crop_to_focus:
         # 메쉬 생성 전에 배경 점을 잘라 ReconstructMesh/텍스처 계산량을 줄인다 (메쉬 단계에서 한 번 더 자름)
