@@ -1,9 +1,4 @@
-"""CLI.
-
-  python -m photogrammetry data/foot.mp4            # 영상 1개
-  python -m photogrammetry data/foot_images/        # 이미지 폴더
-  python -m photogrammetry                          # data/ 안의 모든 영상·이미지 폴더 일괄 처리
-"""
+"""CLI: python -m photogrammetry [영상|이미지 폴더] (생략 시 data/ 일괄 처리)."""
 from __future__ import annotations
 
 import argparse
@@ -11,22 +6,11 @@ import logging
 import sys
 from pathlib import Path
 
-from .config import PipelineConfig
+from .config import QUALITY_PRESETS, PipelineConfig
 from .inputs import VIDEO_EXTS, list_images
 from .pipeline import reconstruct
 from .tools import PROJECT_ROOT
 
-QUALITY = {
-    # CPU에서도 빠르게: 영상 쌍 매칭, 특징점 1600px, MVS는 2장 중 1장, 기하 반복 1회, 텍스처용 메쉬 축소
-    "turbo": dict(feature_max_image_size=1600, video_pair_matching=True, mvs_view_stride=2,
-                  densify_resolution_level=2, densify_iters=2, densify_geometric_iters=1,
-                  refine_mesh=False, texture_resolution_level=0, texture_max_faces=200_000,
-                  texture_smoothness=1.0),
-    "fast": dict(densify_resolution_level=2, refine_mesh=False, texture_resolution_level=1),
-    "normal": dict(densify_resolution_level=1, refine_mesh=True, refine_resolution_level=1),
-    "high": dict(densify_resolution_level=0, densify_max_resolution=4096, refine_mesh=True,
-                 refine_resolution_level=0),
-}
 
 
 def _batch_inputs(data_dir: Path) -> list[Path]:
@@ -44,7 +28,7 @@ def main(argv=None) -> int:
     ap.add_argument("input", nargs="?", help="영상 파일 또는 이미지 폴더 (생략 시 data/ 일괄 처리)")
     ap.add_argument("-o", "--output", default=str(PROJECT_ROOT / "output"), help="출력 폴더 (기본: output/)")
     ap.add_argument("--name", help="출력 파일 이름 (기본: 입력 이름)")
-    ap.add_argument("--quality", choices=QUALITY, default="turbo", help="기본 turbo")
+    ap.add_argument("--quality", choices=QUALITY_PRESETS, default="turbo", help="기본 turbo")
     ap.add_argument("--formats", default="glb,stl,ply", help="쉼표 구분: glb,stl,ply(정점 색),obj")
     ap.add_argument("--scale", type=float, default=1.0, help="출력 배율 (SfM 결과는 임의 스케일)")
     ap.add_argument("--interval", type=float, default=0.5, help="영상 프레임 추출 간격(초)")
@@ -67,7 +51,7 @@ def main(argv=None) -> int:
                         format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("trimesh").setLevel(logging.WARNING)
 
-    cfg = PipelineConfig(**QUALITY[a.quality])
+    cfg = PipelineConfig.preset(a.quality)
     cfg.formats = [f.strip() for f in a.formats.split(",") if f.strip()]
     cfg.scale = a.scale
     cfg.frame_interval_sec = a.interval

@@ -1,4 +1,4 @@
-"""입력 준비: 영상 → 프레임 추출(0.5초당 1장), 이미지 폴더 → 정규화 복사."""
+"""입력 준비: 영상 프레임 추출, 이미지 정규화."""
 from __future__ import annotations
 
 import logging
@@ -12,7 +12,7 @@ from PIL import Image, ImageOps
 
 log = logging.getLogger(__name__)
 
-try:  # 아이폰 HEIC 지원 (선택: pip install pillow-heif)
+try:  # HEIC (선택)
     from pillow_heif import register_heif_opener
     register_heif_opener()
 except ImportError:
@@ -27,7 +27,7 @@ class InputError(ValueError):
 
 
 def classify_input(path: Path) -> tuple[str, Path]:
-    """('video', 파일) 또는 ('images', 폴더) 반환."""
+    """('video', 파일) 또는 ('images', 폴더)."""
     if path.is_file():
         if path.suffix.lower() in VIDEO_EXTS:
             return "video", path
@@ -69,14 +69,14 @@ def _write_jpg(path: Path, img: np.ndarray) -> None:
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
     if not ok:
         raise InputError(f"JPEG 인코딩 실패: {path}")
-    buf.tofile(str(path))  # 비ASCII 경로 대응
+    buf.tofile(str(path))  # 비ASCII 경로
 
 
 def _open_video(video: Path) -> tuple[cv2.VideoCapture, Path | None]:
     cap = cv2.VideoCapture(str(video))
     if cap.isOpened():
         return cap, None
-    # Windows에서 비ASCII 경로를 못 여는 경우 임시 ASCII 경로로 복사 후 재시도
+    # 비ASCII 경로면 임시 복사본으로 재시도
     tmp = Path(tempfile.mkdtemp(prefix="pg_video_")) / ("input" + video.suffix.lower())
     shutil.copy2(video, tmp)
     cap = cv2.VideoCapture(str(tmp))
@@ -87,11 +87,7 @@ def _open_video(video: Path) -> tuple[cv2.VideoCapture, Path | None]:
 
 def extract_frames(video: Path, out_dir: Path, interval: float = 0.5, pick_sharpest: bool = True,
                    max_size: int = 3200, min_sec: float = 30.0, max_sec: float = 60.0) -> list[Path]:
-    """영상을 interval(초) 구간으로 나눠 구간마다 1장씩 저장.
-
-    pick_sharpest=True면 구간 내 프레임 중 라플라시안 분산이 가장 큰(가장 선명한) 프레임을 고른다.
-    모션 블러가 있는 프레임은 특징점 매칭을 크게 해치므로 기본값으로 켜 둔다.
-    """
+    """interval(초) 구간마다 1장 저장. pick_sharpest면 구간 내 최선명 프레임."""
     out_dir.mkdir(parents=True, exist_ok=True)
     cap, tmp = _open_video(video)
     try:
@@ -102,7 +98,7 @@ def extract_frames(video: Path, out_dir: Path, interval: float = 0.5, pick_sharp
             log.warning("FPS 정보를 읽지 못해 30fps로 가정합니다.")
         duration = n_frames / fps if n_frames > 0 else 0.0
         log.info("영상: %s (%.1f fps, %d frames, %.1f s)", video.name, fps, n_frames, duration)
-        if duration and not (min_sec - 1 <= duration <= max_sec + 1):  # 프레임 반올림 오차 허용
+        if duration and not (min_sec - 1 <= duration <= max_sec + 1):
             log.warning("영상 길이 %.1f초는 권장 범위(%.0f~%.0f초)를 벗어납니다.", duration, min_sec, max_sec)
 
         saved: list[Path] = []
@@ -119,7 +115,6 @@ def extract_frames(video: Path, out_dir: Path, interval: float = 0.5, pick_sharp
             t = idx / fps
             b = int(t / interval + 1e-9)
             if not pick_sharpest and b == cur_bin:
-                # 구간 시작 프레임만 쓰므로 나머지는 디코딩 없이 건너뜀
                 if not cap.grab():
                     break
                 idx += 1
@@ -147,11 +142,7 @@ def extract_frames(video: Path, out_dir: Path, interval: float = 0.5, pick_sharp
 
 
 def prepare_images(src_dir: Path, out_dir: Path, max_size: int = 3200) -> tuple[list[Path], bool]:
-    """이미지를 EXIF 회전 적용 + 크기 제한 후 ASCII 파일명으로 복사.
-
-    반환: (저장 경로 목록, 모든 이미지 해상도가 동일한지)
-    EXIF(초점거리 등)는 COLMAP이 초기 내부 파라미터 추정에 쓰므로 유지한다.
-    """
+    """EXIF 회전·크기 제한 후 복사. (경로 목록, 해상도 동일 여부) 반환."""
     out_dir.mkdir(parents=True, exist_ok=True)
     srcs = list_images(src_dir)
     saved, sizes = [], set()

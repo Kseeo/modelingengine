@@ -15,7 +15,7 @@ from .config import PipelineConfig
 from .export import export_models
 from .mvs import run_mvs
 from .sfm import run_sfm
-from .tools import find_colmap, find_openmvs_dir
+from .tools import find_colmap, find_openmvs_dir, fresh_dir
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ def _is_ascii(p: Path) -> bool:
 
 
 def _workspace(output_dir: Path, name: str) -> Path:
-    """중간 작업 폴더. OpenMVS/COLMAP은 비ASCII·공백 경로에서 실패할 수 있어 안전한 경로를 고른다."""
+    """작업 폴더 (외부 도구용으로 ASCII·공백 없는 경로)."""
     preferred = output_dir / "work"
     if _is_ascii(preferred.resolve()):
         return preferred
@@ -43,10 +43,7 @@ def _workspace(output_dir: Path, name: str) -> Path:
 
 def reconstruct(input_path: str | Path, output_dir: str | Path, name: str | None = None,
                 config: PipelineConfig | None = None) -> dict:
-    """영상(30~60초) 또는 이미지 폴더(20장 이상)를 받아 GLB/STL을 생성한다.
-
-    반환: 결과 요약 dict (report.json 으로도 저장)
-    """
+    """영상 또는 이미지 폴더 → GLB/STL. 결과 요약 dict 반환 (report.json에도 저장)."""
     cfg = config or PipelineConfig()
     t0 = time.time()
     input_path = Path(input_path).resolve()
@@ -61,9 +58,7 @@ def reconstruct(input_path: str | Path, output_dir: str | Path, name: str | None
 
     work = _workspace(output_dir, name)
     work.mkdir(parents=True, exist_ok=True)
-    images_dir = work / "images"
-    if images_dir.exists():
-        shutil.rmtree(images_dir)
+    images_dir = fresh_dir(work / "images")
 
     log.info("=== [1/4] 입력 준비 (%s) ===", kind)
     if kind == "video":

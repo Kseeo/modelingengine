@@ -1,4 +1,4 @@
-"""메쉬를 GLB(텍스처 포함, Y-up) / STL(형상만, Z-up)으로 내보내기."""
+"""GLB(텍스처, Y-up) / STL·PLY(형상, Z-up) 내보내기."""
 from __future__ import annotations
 
 import logging
@@ -11,10 +11,10 @@ from .plyio import points_and_colors, read_vertex_ply
 
 log = logging.getLogger(__name__)
 
-# COLMAP 좌표계(정렬 후 위쪽 = -Y)를 Z-up으로: (x, y, z) -> (x, z, -y)
+# COLMAP(위 = -Y) → Z-up
 _COLMAP_TO_ZUP = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, -1, 0, 0], [0, 0, 0, 1]], dtype=float)
-# Z-up -> Y-up (glTF 규약): (x, y, z) -> (x, z, -y)
-_ZUP_TO_YUP = _COLMAP_TO_ZUP
+# Z-up → Y-up (glTF)
+_ZUP_TO_YUP = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, -1, 0, 0], [0, 0, 0, 1]], dtype=float)
 
 
 def _to_single_mesh(scene: trimesh.Scene) -> trimesh.Trimesh:
@@ -23,14 +23,9 @@ def _to_single_mesh(scene: trimesh.Scene) -> trimesh.Trimesh:
     return trimesh.util.concatenate(scene.dump())
 
 
-def read_colored_points(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """OpenMVS 조밀 점군 PLY에서 (xyz, rgb)."""
-    return points_and_colors(read_vertex_ply(path))
-
-
 def vertex_colors_from_points(vertices: np.ndarray, points: np.ndarray, colors: np.ndarray,
                               k: int = 4) -> np.ndarray:
-    """각 정점에 가장 가까운 k개 조밀 점 색의 역거리 가중 평균 (RGBA uint8)."""
+    """가까운 k개 점 색의 역거리 가중 평균 (RGBA uint8)."""
     from scipy.spatial import cKDTree
 
     dist, idx = cKDTree(points).query(vertices, k=k, workers=-1)
@@ -41,7 +36,7 @@ def vertex_colors_from_points(vertices: np.ndarray, points: np.ndarray, colors: 
 
 
 def textured_surface_samples(scene: trimesh.Scene, n_samples: int) -> tuple[np.ndarray, np.ndarray] | None:
-    """텍스처 메쉬 표면을 면적 비례로 촘촘히 샘플링해 (점, 텍스처 색 RGB) 반환. 텍스처가 없으면 None."""
+    """텍스처 메쉬 표면 샘플 (점, RGB). 텍스처가 없으면 None."""
     geoms = scene.dump()
     geoms = geoms if isinstance(geoms, list) else [geoms]
     textured = []
@@ -66,14 +61,27 @@ def textured_surface_samples(scene: trimesh.Scene, n_samples: int) -> tuple[np.n
     return np.vstack(pts_all), np.vstack(rgb_all)
 
 
+def _ply_vertex_colors(mesh: trimesh.Trimesh, visual: trimesh.Scene, color_source: Path | None,
+                       xf: np.ndarray) -> np.ndarray | None:
+    """텍스처 샘플 → 조밀 점군 순으로 정점 색 결정. 둘 다 없으면 None."""
+    vertices = np.asarray(mesh.vertices)
+    samples = textured_surface_samples(visual, int(np.clip(8 * len(vertices), 1_000_000, 4_000_000)))
+    if samples is not None:
+        # 원본 해상도 텍스처가 점군 색보다 선명
+        log.info("PLY 정점 색: 텍스처 표면 %d점 샘플에서 매핑", len(samples[0]))
+        return vertex_colors_from_points(vertices, samples[0], samples[1], k=3)
+    if color_source is not None and Path(color_source).is_file():
+        xyz, rgb = points_and_colors(read_vertex_ply(color_source))
+        pts = trimesh.transform_points(xyz, xf)
+        log.info("PLY 정점 색: 조밀 점군 %d점에서 매핑", len(pts))
+        return vertex_colors_from_points(vertices, pts, rgb)
+    return None
+
+
 def export_models(mesh_path: Path, out_dir: Path, name: str, formats: list[str],
                   scale: float = 1.0, place_on_ground: bool = True,
                   shape_path: Path | None = None, color_source: Path | None = None) -> dict:
-    """mesh_path: 시각용(텍스처) 메쉬 → GLB. shape_path: 형상용 메쉬 → STL/PLY/OBJ (없으면 mesh_path).
-    color_source: 색이 있는 조밀 점군(.ply) → PLY 정점 색 (없으면 무색 PLY).
-
-    두 메쉬는 같은 좌표계이므로 동일한 변환(축 정렬·배율·바닥 배치)을 적용한다.
-    """
+    """mesh_path → GLB, shape_path(없으면 mesh_path) → STL/PLY/OBJ. 두 메쉬에 같은 변환 적용."""
     visual = trimesh.load(mesh_path, force="scene")
     if not visual.geometry:
         raise ValueError(f"빈 메쉬입니다: {mesh_path}")
@@ -110,20 +118,9 @@ def export_models(mesh_path: Path, out_dir: Path, name: str, formats: list[str],
             yup.export(path)
         elif fmt == "ply":
             colored = merged.copy()
-            nv = len(colored.vertices)
-            samples = textured_surface_samples(visual, int(np.clip(8 * nv, 1_000_000, 4_000_000)))
-            if samples is not None:
-                # 텍스처(원본 해상도 사진)에서 색을 가져온다: 조밀 점군 색(깊이맵 해상도)보다 선명
-                colored.visual = trimesh.visual.ColorVisuals(
-                    colored, vertex_colors=vertex_colors_from_points(
-                        np.asarray(colored.vertices), samples[0], samples[1], k=3))
-                log.info("PLY 정점 색: 텍스처 표면 %d점 샘플에서 매핑", len(samples[0]))
-            elif color_source is not None and Path(color_source).is_file():
-                xyz, rgb = read_colored_points(color_source)
-                pts = trimesh.transform_points(xyz, xf)  # 형상과 같은 변환
-                colored.visual = trimesh.visual.ColorVisuals(
-                    colored, vertex_colors=vertex_colors_from_points(np.asarray(colored.vertices), pts, rgb))
-                log.info("PLY 정점 색: 조밀 점군 %d점에서 매핑", len(pts))
+            colors = _ply_vertex_colors(colored, visual, color_source, xf)
+            if colors is not None:
+                colored.visual = trimesh.visual.ColorVisuals(colored, vertex_colors=colors)
             else:
                 log.warning("색 점군이 없어 무색 PLY로 저장합니다.")
             colored.export(path)

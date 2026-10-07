@@ -1,8 +1,4 @@
-"""Structure-from-Motion (COLMAP).
-
-특징점 추출 → 매칭 → 증분식 SfM(카메라 포즈 + 희소 점군) → 중력 방향 정렬 → 왜곡 보정.
-결과는 OpenMVS가 읽는 COLMAP undistorted 워크스페이스(dense/images, dense/sparse).
-"""
+"""SfM (COLMAP): 특징점 → 매칭 → 포즈·희소 점군 → 방향 정렬 → 왜곡 보정."""
 from __future__ import annotations
 
 import logging
@@ -14,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from .config import PipelineConfig
-from .tools import ToolError, run
+from .tools import ToolError, fresh_dir, run
 
 log = logging.getLogger(__name__)
 
@@ -26,11 +22,11 @@ class SfmResult:
     num_registered: int
     num_points: int
     aligned_up: bool
-    depth_dir: Path | None = None  # 깊이맵용 부분 모델 폴더(sparse/ 포함). None이면 dense_dir 사용
+    depth_dir: Path | None = None  # 깊이맵용 부분 모델 (None이면 dense_dir)
 
 
 def _count_bin(path: Path) -> int:
-    """cameras/images/points3D.bin 첫 8바이트 = 항목 수."""
+    """COLMAP .bin 항목 수."""
     with open(path, "rb") as f:
         return struct.unpack("<Q", f.read(8))[0]
 
@@ -46,22 +42,6 @@ def _best_model(sparse_root: Path) -> tuple[Path, int]:
     return scored[0][1], scored[0][0]
 
 
-def read_image_names(images_bin: Path) -> list[str]:
-    """images.bin에서 등록된 이미지 파일명 목록."""
-    names = []
-    with open(images_bin, "rb") as f:
-        n = struct.unpack("<Q", f.read(8))[0]
-        for _ in range(n):
-            f.read(4 + 32 + 24 + 4)  # image_id, qvec, tvec, camera_id
-            name = bytearray()
-            while (ch := f.read(1)) != b"\0":
-                name += ch
-            num_pts = struct.unpack("<Q", f.read(8))[0]
-            f.seek(24 * num_pts, 1)
-            names.append(name.decode("utf-8"))
-    return names
-
-
 def _qvec_to_rot(q) -> np.ndarray:
     w, x, y, z = q
     return np.array([
@@ -69,74 +49,6 @@ def _qvec_to_rot(q) -> np.ndarray:
         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
     ])
-
-
-def read_camera_rays(images_bin: Path) -> list[tuple[np.ndarray, np.ndarray]]:
-    """등록된 각 카메라의 (중심, 광축 방향) — 월드 좌표."""
-    rays = []
-    with open(images_bin, "rb") as f:
-        n = struct.unpack("<Q", f.read(8))[0]
-        for _ in range(n):
-            f.read(4)
-            q = struct.unpack("<4d", f.read(32))
-            t = np.array(struct.unpack("<3d", f.read(24)))
-            f.read(4)
-            while f.read(1) != b"\0":
-                pass
-            num_pts = struct.unpack("<Q", f.read(8))[0]
-            f.seek(24 * num_pts, 1)
-            r = _qvec_to_rot(q)
-            rays.append((-r.T @ t, r.T @ np.array([0.0, 0.0, 1.0])))
-    return rays
-
-
-def camera_focus(images_bin: Path) -> tuple[np.ndarray, float] | None:
-    """모든 카메라 광축에 최소제곱으로 가장 가까운 점 = 촬영자가 화면 중앙에 두고 찍은 대상.
-
-    반환: (초점, 카메라-초점 거리 중앙값). 카메라들이 한 점을 보고 있지 않으면 None.
-    """
-    rays = read_camera_rays(images_bin)
-    if len(rays) < 3:
-        return None
-    centers = np.array([c for c, _ in rays])
-    dirs = np.array([d for _, d in rays])
-    proj = np.eye(3)[None] - dirs[:, :, None] * dirs[:, None, :]  # 광축에 수직인 성분으로의 투영
-    w = np.ones(len(rays))
-    focus = None
-    # IRLS(L1): 대상과 다른 곳을 보는 프레임이나 포즈가 틀린 카메라 몇 대에 끌려가지 않도록
-    # 광축-점 거리가 큰 카메라의 가중치를 줄여 가며 반복한다
-    for _ in range(10):
-        a = (w[:, None, None] * proj).sum(axis=0)
-        if np.linalg.cond(a) > 1e6:
-            return None
-        focus = np.linalg.solve(a, (w[:, None] * np.einsum("nij,nj->ni", proj, centers)).sum(axis=0))
-        dist = np.linalg.norm(np.einsum("nij,nj->ni", proj, focus - centers), axis=1)
-        w = 1.0 / np.maximum(dist, 0.1 * np.median(dist) + 1e-9)
-    in_front = np.mean([(focus - c) @ d > 0 for c, d in rays])
-    if in_front < 0.8:  # 대상이 카메라 뒤에 있는 경우가 많으면 물체 중심 촬영이 아님
-        return None
-    return focus, float(np.median([np.linalg.norm(c - focus) for c, _ in rays]))
-
-
-# COLMAP 카메라 모델 id → 파라미터 수
-_CAM_NUM_PARAMS = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8, 5: 8, 6: 12, 7: 5, 8: 4, 9: 5, 10: 12, 11: 16}
-
-
-def read_cameras(cameras_bin: Path) -> dict[int, tuple[int, int, float, float, float, float]]:
-    """camera_id → (width, height, fx, fy, cx, cy). 왜곡 계수는 무시."""
-    cams = {}
-    with open(cameras_bin, "rb") as f:
-        n = struct.unpack("<Q", f.read(8))[0]
-        for _ in range(n):
-            cam_id, model_id = struct.unpack("<ii", f.read(8))
-            w, h = struct.unpack("<QQ", f.read(16))
-            k = _CAM_NUM_PARAMS[model_id]
-            p = struct.unpack(f"<{k}d", f.read(8 * k))
-            if model_id in (0, 2, 3, 7, 8, 9):  # SIMPLE_* : f, cx, cy
-                cams[cam_id] = (w, h, p[0], p[0], p[1], p[2])
-            else:
-                cams[cam_id] = (w, h, p[0], p[1], p[2], p[3])
-    return cams
 
 
 def read_images(images_bin: Path) -> list[tuple[str, np.ndarray, np.ndarray, int]]:
@@ -158,13 +70,62 @@ def read_images(images_bin: Path) -> list[tuple[str, np.ndarray, np.ndarray, int
     return out
 
 
-def make_focus_masks(model: Path, images_dir: Path, out_dir: Path, radius_factor: float) -> Path | None:
-    """촬영 대상(카메라 광축 수렴점) 주변 구를 각 프레임에 투영한 원형 마스크 (COLMAP mask_path 형식).
+def read_image_names(images_bin: Path) -> list[str]:
+    return [name for name, *_ in read_images(images_bin)]
 
-    분할 모델 없이 기하 계산만으로 만들기 때문에 수 초면 끝난다.
-    미등록 프레임은 파일명 순서상 가장 가까운 등록 프레임의 원을 그대로 쓴다.
-    """
-    import cv2  # 지연 import: SfM 단독 사용 시 불필요
+
+def read_camera_rays(images_bin: Path) -> list[tuple[np.ndarray, np.ndarray]]:
+    """카메라별 (중심, 광축 방향), 월드 좌표."""
+    return [(-r.T @ t, r[2]) for _, r, t, _ in read_images(images_bin)]
+
+
+def camera_focus(images_bin: Path) -> tuple[np.ndarray, float] | None:
+    """카메라 광축들이 모이는 점과 카메라-초점 거리 중앙값. 한 점을 향하지 않으면 None."""
+    rays = read_camera_rays(images_bin)
+    if len(rays) < 3:
+        return None
+    centers = np.array([c for c, _ in rays])
+    dirs = np.array([d for _, d in rays])
+    proj = np.eye(3)[None] - dirs[:, :, None] * dirs[:, None, :]
+    w = np.ones(len(rays))
+    focus = None
+    # IRLS: 이상치 카메라 영향 축소
+    for _ in range(10):
+        a = (w[:, None, None] * proj).sum(axis=0)
+        if np.linalg.cond(a) > 1e6:
+            return None
+        focus = np.linalg.solve(a, (w[:, None] * np.einsum("nij,nj->ni", proj, centers)).sum(axis=0))
+        dist = np.linalg.norm(np.einsum("nij,nj->ni", proj, focus - centers), axis=1)
+        w = 1.0 / np.maximum(dist, 0.1 * np.median(dist) + 1e-9)
+    in_front = np.mean([(focus - c) @ d > 0 for c, d in rays])
+    if in_front < 0.8:
+        return None
+    return focus, float(np.median([np.linalg.norm(c - focus) for c, _ in rays]))
+
+
+_CAM_NUM_PARAMS = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8, 5: 8, 6: 12, 7: 5, 8: 4, 9: 5, 10: 12, 11: 16}
+
+
+def read_cameras(cameras_bin: Path) -> dict[int, tuple[int, int, float, float, float, float]]:
+    """camera_id → (width, height, fx, fy, cx, cy)."""
+    cams = {}
+    with open(cameras_bin, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        for _ in range(n):
+            cam_id, model_id = struct.unpack("<ii", f.read(8))
+            w, h = struct.unpack("<QQ", f.read(16))
+            k = _CAM_NUM_PARAMS[model_id]
+            p = struct.unpack(f"<{k}d", f.read(8 * k))
+            if model_id in (0, 2, 3, 7, 8, 9):  # 단일 초점거리 모델
+                cams[cam_id] = (w, h, p[0], p[0], p[1], p[2])
+            else:
+                cams[cam_id] = (w, h, p[0], p[1], p[2], p[3])
+    return cams
+
+
+def make_focus_masks(model: Path, images_dir: Path, out_dir: Path, radius_factor: float) -> Path | None:
+    """촬영 대상 주변 구를 각 프레임에 투영한 원형 마스크. 미등록 프레임은 가장 가까운 프레임 것 사용."""
+    import cv2
     from PIL import Image
 
     res = camera_focus(model / "images.bin")
@@ -174,7 +135,7 @@ def make_focus_masks(model: Path, images_dir: Path, out_dir: Path, radius_factor
     focus, cam_dist = res
     radius = radius_factor * cam_dist
     cams = read_cameras(model / "cameras.bin")
-    circles = {}  # name → (정규화 u, v, r)
+    circles = {}  # name → (u, v, r), 정규화 좌표
     for name, r, t, cam_id in read_images(model / "images.bin"):
         w, h, fx, fy, cx, cy = cams[cam_id]
         xc = r @ focus + t
@@ -185,16 +146,14 @@ def make_focus_masks(model: Path, images_dir: Path, out_dir: Path, radius_factor
     if not circles:
         return None
 
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True)
+    fresh_dir(out_dir)
     names = sorted(p.name for p in images_dir.iterdir())
     reg_idx = [i for i, n in enumerate(names) if n in circles]
     coverage = []
     for i, name in enumerate(names):
         src = name if name in circles else names[min(reg_idx, key=lambda j: abs(j - i))]
         u, v, rad = circles[src]
-        with Image.open(images_dir / name) as im:  # 헤더만 읽음
+        with Image.open(images_dir / name) as im:
             w, h = im.size
         mask = np.zeros((h, w), np.uint8)
         cv2.circle(mask, (round(u * w), round(v * h)), round(rad * max(w, h)), 255, -1)
@@ -205,10 +164,7 @@ def make_focus_masks(model: Path, images_dir: Path, out_dir: Path, radius_factor
 
 
 def video_pairs(names: list[str], window: int, global_stride: int) -> list[tuple[str, str]]:
-    """시간 순 프레임의 매칭 쌍: 앞뒤 window 이웃 + 순환 이웃(끝↔처음, 한 바퀴 촬영의 루프) + 희소 전역 쌍.
-
-    전체 쌍(n²/2) 대비 수 배 적으면서, 대상을 한 바퀴 돌아 처음 위치로 돌아왔을 때의 루프도 연결된다.
-    """
+    """영상 매칭 쌍: 앞뒤 window 이웃(순환) + global_stride 간격 전역 쌍."""
     n = len(names)
     pairs = set()
     for i in range(n):
@@ -223,7 +179,7 @@ def video_pairs(names: list[str], window: int, global_stride: int) -> list[tuple
 
 def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
             single_camera: bool, ordered: bool = False) -> SfmResult:
-    """ordered=True: 영상 프레임처럼 파일명 순서가 촬영 순서인 입력."""
+    """ordered: 파일명 순서 = 촬영 순서 (영상)."""
     bin_dir = colmap.parent
     logf = work / "colmap.log"
     db = work / "database.db"
@@ -244,7 +200,7 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
     used_pairs = ordered and cfg.video_pair_matching
 
     def reconstruct_sparse(db: Path, out: Path, mask_dir: Path | None = None, tag: str = "") -> tuple[Path | None, int]:
-        """특징점 추출 → 매칭 → 증분식 복원. (최대 모델, 등록 수) 반환."""
+        """(최대 모델, 등록 수)."""
         nonlocal gpu
         db.unlink(missing_ok=True)
         mask_args = ["--ImageReader.mask_path", mask_dir] if mask_dir else []
@@ -264,7 +220,6 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
         except ToolError as e:
             if gpu == "0":
                 raise
-            # CUDA 드라이버가 COLMAP 빌드보다 오래됐거나 GPU가 없으면 CPU로 재시도
             log.warning("GPU 특징점 추출 실패 → CPU로 재시도 (느림). GPU 드라이버 업데이트를 권장합니다.\n  %s",
                         str(e).splitlines()[-1])
             gpu = "0"
@@ -291,9 +246,7 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
                        "--SequentialMatching.overlap", str(cfg.sequential_overlap))
 
         def map_sparse():
-            if out.exists():
-                shutil.rmtree(out)
-            out.mkdir()
+            fresh_dir(out)
             colmap_run("mapper", "--database_path", db, "--image_path", images_dir,
                        "--output_path", out)
             return _best_model(out)
@@ -306,7 +259,7 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
                 raise
             model, n_reg = None, 0
         if used_pairs and n_reg < 0.9 * num_input:
-            # 영상 쌍 매칭이 끊긴 구간을 못 이은 경우: 남은 쌍만 추가 매칭 (이미 매칭된 쌍은 COLMAP이 건너뜀)
+            # 끊긴 구간 연결: 남은 쌍 추가 매칭
             log.warning("영상 쌍 매칭으로 %d / %d장만 등록 → 나머지 쌍을 추가 매칭 후 재복원", n_reg, num_input)
             colmap_run("exhaustive_matcher", "--database_path", db, "--FeatureMatching.use_gpu", gpu)
             model, n_reg = map_sparse()
@@ -317,8 +270,7 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
         raise ToolError("SfM 복원 실패: 카메라 포즈를 추정하지 못했습니다.")
 
     if cfg.object_centric:
-        # 대상이 촬영 중 (배경에 대해) 움직였을 때: 대상 주변 특징점만으로 포즈를 다시 추정해
-        # 대상을 기준 좌표계로 삼는다. 대상의 강체 움직임이 카메라 움직임으로 흡수된다.
+        # 대상 주변 특징점만으로 포즈 재추정 (촬영 중 대상 움직임 보정)
         mask_dir = make_focus_masks(model, images_dir, work / "masks", cfg.object_mask_radius_factor)
         if mask_dir is not None:
             try:
@@ -341,9 +293,7 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
     if cfg.align_up:
         log.info("[SfM 4/5] 위쪽 방향 정렬 (카메라 업벡터 기준)")
         aligned_dir = work / "sparse_aligned"
-        if aligned_dir.exists():
-            shutil.rmtree(aligned_dir)
-        aligned_dir.mkdir()
+        fresh_dir(aligned_dir)
         try:
             colmap_run("model_orientation_aligner", "--image_path", images_dir,
                        "--input_path", model, "--output_path", aligned_dir,
@@ -359,7 +309,7 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
 
     depth_dir = None
     if cfg.mvs_view_stride > 1:
-        # 깊이맵용으로만 N장 중 1장을 남긴 모델 (텍스처는 전체 이미지 사용). 이미지 파일은 dense/images 공유
+        # 깊이맵용 부분 모델 (텍스처는 전체 사용)
         reg = sorted(read_image_names(dense / "sparse" / "images.bin"))
         drop = [n for i, n in enumerate(reg) if i % cfg.mvs_view_stride]
         if len(reg) - len(drop) >= cfg.min_images:

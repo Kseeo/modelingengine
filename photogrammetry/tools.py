@@ -1,4 +1,4 @@
-"""외부 실행 파일(COLMAP, OpenMVS) 탐색과 실행."""
+"""외부 도구(COLMAP, OpenMVS) 탐색·실행."""
 from __future__ import annotations
 
 import logging
@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections import deque
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -17,6 +18,14 @@ EXE = ".exe" if sys.platform == "win32" else ""
 
 class ToolError(RuntimeError):
     pass
+
+
+def fresh_dir(path: Path) -> Path:
+    """폴더를 비우고 새로 만든다."""
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+    return path
 
 
 def find_colmap() -> Path:
@@ -58,14 +67,14 @@ def find_openmvs_dir() -> Path:
 
 
 def run(cmd: list, cwd: Path, log_file: Path, env_path: Path | None = None) -> None:
-    """명령 실행. 출력은 로그 파일과 콘솔(DEBUG)에 기록하고 실패 시 ToolError."""
+    """명령 실행, 출력은 log_file에 기록. 실패 시 ToolError."""
     cmd = [str(c) for c in cmd]
     env = os.environ.copy()
     if env_path is not None:
         env["PATH"] = str(env_path) + os.pathsep + env.get("PATH", "")
     log.info("$ %s", " ".join(Path(cmd[0]).name if i == 0 else c for i, c in enumerate(cmd)))
     cwd.mkdir(parents=True, exist_ok=True)
-    tail: list[str] = []
+    tail: deque[str] = deque(maxlen=30)
     with open(log_file, "a", encoding="utf-8") as lf:
         lf.write("\n$ " + " ".join(cmd) + "\n")
         proc = subprocess.Popen(
@@ -77,7 +86,6 @@ def run(cmd: list, cwd: Path, log_file: Path, env_path: Path | None = None) -> N
             lf.write(line)
             log.debug(line.rstrip())
             tail.append(line.rstrip())
-            tail = tail[-30:]
         ret = proc.wait()
     if ret != 0:
         raise ToolError(

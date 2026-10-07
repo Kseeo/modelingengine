@@ -1,8 +1,4 @@
-"""OpenMVS 조밀 점군 PLY 읽기/자르기.
-
-OpenMVS는 정점마다 가변 길이 리스트(view_indices, view_weights)를 붙인다. trimesh는 이 형식을 읽지 못하고,
-ReconstructMesh는 이 가시성 정보를 사용하므로 자를 때도 레코드를 바이트 그대로 보존해야 한다.
-"""
+"""OpenMVS 조밀 점군 PLY 읽기/자르기 (가시성 리스트를 바이트 그대로 보존)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,11 +13,11 @@ _PLY_TYPES = {"int8": "i1", "char": "i1", "uint8": "u1", "uchar": "u1", "int16":
 
 @dataclass
 class VertexPly:
-    header: list[str]       # end_header 포함 헤더 줄
-    data: np.ndarray        # 헤더 뒤 바이트 (uint8)
-    starts: np.ndarray      # 각 정점 레코드 시작 오프셋
-    ends: np.ndarray        # 각 정점 레코드 끝 오프셋
-    fixed: np.ndarray       # 고정 길이 스칼라 속성 (structured array)
+    header: list[str]
+    data: np.ndarray        # 헤더 뒤 바이트
+    starts: np.ndarray      # 레코드 시작 오프셋
+    ends: np.ndarray
+    fixed: np.ndarray       # 스칼라 속성
 
 
 def read_vertex_ply(path: Path) -> VertexPly:
@@ -55,7 +51,7 @@ def read_vertex_ply(path: Path) -> VertexPly:
         starts[:] = np.arange(n) * fixed_dt.itemsize
         ends[:] = starts + fixed_dt.itemsize
     else:
-        off = 0  # 가변 길이라 레코드 경계를 순차 계산
+        off = 0
         for i in range(n):
             starts[i] = off
             off += fixed_dt.itemsize
@@ -75,11 +71,10 @@ def points_and_colors(ply: VertexPly) -> tuple[np.ndarray, np.ndarray]:
 
 
 def write_vertex_subset(ply: VertexPly, keep: np.ndarray, dst: Path) -> int:
-    """keep(bool 마스크)에 해당하는 정점 레코드만 바이트 그대로 저장. 저장한 정점 수 반환."""
+    """keep 마스크의 정점만 저장하고 정점 수 반환."""
     idx = np.flatnonzero(keep)
     header = [f"element vertex {len(idx)}" if ln.startswith("element vertex") else ln for ln in ply.header]
     lengths = ply.ends[idx] - ply.starts[idx]
-    # 레코드별 바이트 범위를 한 번에 모으기 위한 인덱스
     offsets = np.repeat(ply.starts[idx] - np.concatenate([[0], np.cumsum(lengths)[:-1]]), lengths)
     body = ply.data[np.arange(lengths.sum()) + offsets]
     with open(dst, "wb") as f:
