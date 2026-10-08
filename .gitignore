@@ -1,5 +1,7 @@
 tools/
 output/
+api_uploads/
+api_output/
 data/*
 !data/README.md
 __pycache__/

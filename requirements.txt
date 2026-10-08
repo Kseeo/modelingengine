@@ -4,5 +4,8 @@ Pillow>=10.0
 trimesh>=4.0
 scipy
 networkx
+fastapi
+uvicorn[standard]
+python-multipart
 # 아이폰 HEIC 사진을 쓸 경우
 # pillow-heif
