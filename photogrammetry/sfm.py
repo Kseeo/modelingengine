@@ -123,7 +123,8 @@ def read_cameras(cameras_bin: Path) -> dict[int, tuple[int, int, float, float, f
     return cams
 
 
-def make_focus_masks(model: Path, images_dir: Path, out_dir: Path, radius_factor: float) -> Path | None:
+def make_focus_masks(model: Path, images_dir: Path, out_dir: Path, radius_factor: float,
+                     mask_name=lambda name: f"{name}.png") -> Path | None:
     """촬영 대상 주변 구를 각 프레임에 투영한 원형 마스크. 미등록 프레임은 가장 가까운 프레임 것 사용."""
     import cv2
     from PIL import Image
@@ -158,7 +159,7 @@ def make_focus_masks(model: Path, images_dir: Path, out_dir: Path, radius_factor
         mask = np.zeros((h, w), np.uint8)
         cv2.circle(mask, (round(u * w), round(v * h)), round(rad * max(w, h)), 255, -1)
         coverage.append(mask.mean() / 255)
-        cv2.imencode(".png", mask)[1].tofile(str(out_dir / f"{name}.png"))
+        cv2.imencode(".png", mask)[1].tofile(str(out_dir / mask_name(name)))
     log.info("대상 마스크 %d장 생성 (반경 %.2f, 화면 평균 %.0f%% 영역)", len(names), radius, 100 * np.mean(coverage))
     return out_dir
 
@@ -199,7 +200,9 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
 
     used_pairs = ordered and cfg.video_pair_matching
 
-    def reconstruct_sparse(db: Path, out: Path, mask_dir: Path | None = None, tag: str = "") -> tuple[Path | None, int]:
+    def reconstruct_sparse(db: Path, out: Path, mask_dir: Path | None = None, tag: str = "",
+                           image_size: int = cfg.feature_max_image_size, max_features: int = cfg.feature_max_num,
+                           refill_ratio: float = 0.9) -> tuple[Path | None, int]:
         """(최대 모델, 등록 수)."""
         nonlocal gpu
         db.unlink(missing_ok=True)
@@ -211,8 +214,8 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
                        "--ImageReader.camera_model", cfg.camera_model,
                        "--ImageReader.single_camera", "1" if single_camera else "0",
                        "--FeatureExtraction.use_gpu", use_gpu, *mask_args,
-                       *(["--FeatureExtraction.max_image_size", str(cfg.feature_max_image_size)]
-                         if cfg.feature_max_image_size > 0 else []))
+                       *(["--FeatureExtraction.max_image_size", str(image_size)] if image_size > 0 else []),
+                       *(["--SiftExtraction.max_num_features", str(max_features)] if max_features > 0 else []))
 
         log.info("[SfM 1/5]%s 특징점 추출 (SIFT, %s)", tag, "GPU" if gpu == "1" else "CPU")
         try:
@@ -258,32 +261,36 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
             if not used_pairs:
                 raise
             model, n_reg = None, 0
-        if used_pairs and n_reg < 0.9 * num_input:
+        if used_pairs and n_reg < refill_ratio * num_input:
             # 끊긴 구간 연결: 남은 쌍 추가 매칭
             log.warning("영상 쌍 매칭으로 %d / %d장만 등록 → 나머지 쌍을 추가 매칭 후 재복원", n_reg, num_input)
             colmap_run("exhaustive_matcher", "--database_path", db, "--FeatureMatching.use_gpu", gpu)
             model, n_reg = map_sparse()
         return model, n_reg
 
-    model, n_reg = reconstruct_sparse(db, sparse)
-    if model is None:
-        raise ToolError("SfM 복원 실패: 카메라 포즈를 추정하지 못했습니다.")
-
     if cfg.object_centric:
-        # 대상 주변 특징점만으로 포즈 재추정 (촬영 중 대상 움직임 보정)
+        model, n_reg = reconstruct_sparse(db, sparse, tag=" (초점 탐색)", image_size=cfg.scout_image_size,
+                                          max_features=cfg.scout_max_features, refill_ratio=0.5)
+        if model is None:
+            raise ToolError("SfM 복원 실패: 카메라 포즈를 추정하지 못했습니다.")
         mask_dir = make_focus_masks(model, images_dir, work / "masks", cfg.object_mask_radius_factor)
+        model2, n_reg2 = None, 0
         if mask_dir is not None:
             try:
                 model2, n_reg2 = reconstruct_sparse(work / "database_obj.db", work / "sparse_obj",
-                                                    mask_dir, tag=" (대상 기준)")
+                                                    mask_dir, tag=" (대상 기준)", refill_ratio=0.8)
             except ToolError as e:
-                model2, n_reg2 = None, 0
                 log.warning("대상 기준 SfM 실패: %s", str(e).splitlines()[0])
-            if model2 is not None and n_reg2 >= cfg.object_min_reg_ratio * n_reg:
-                log.info("대상 기준 포즈 사용: 등록 %d장 (배경 기준 %d장)", n_reg2, n_reg)
-                model, n_reg = model2, n_reg2
-            else:
-                log.warning("대상 기준 등록이 부족해 배경 기준 포즈를 유지합니다 (%d vs %d장)", n_reg2, n_reg)
+        if model2 is not None and n_reg2 >= cfg.object_min_reg_ratio * n_reg:
+            log.info("대상 기준 포즈 사용: 등록 %d장 (초점 탐색 %d장)", n_reg2, n_reg)
+            model, n_reg = model2, n_reg2
+        else:
+            log.warning("대상 기준 등록 부족 (%d vs %d장) → 배경 기준 SfM 재실행", n_reg2, n_reg)
+            model, n_reg = reconstruct_sparse(db, sparse)
+    else:
+        model, n_reg = reconstruct_sparse(db, sparse)
+    if model is None:
+        raise ToolError("SfM 복원 실패: 카메라 포즈를 추정하지 못했습니다.")
 
     log.info("등록된 이미지: %d / %d", n_reg, num_input)
     if n_reg < 0.5 * num_input:

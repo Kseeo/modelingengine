@@ -37,7 +37,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-refine", action="store_true")
     ap.add_argument("--keep-all-components", action="store_true", help="떠다니는 조각을 제거하지 않음")
     ap.add_argument("--object-centric", action="store_true",
-                    help="대상 주변 특징점만으로 포즈 재추정 (촬영 중 발이 움직인 영상 보정, SfM 1회 추가)")
+                    help="대상 주변 특징점만으로 포즈 재추정 (turbo 기본)")
+    ap.add_argument("--no-object-centric", action="store_true", help="배경 기준 포즈만 사용")
     ap.add_argument("--no-crop", action="store_true", help="촬영 대상 주변 자르기 끄기 (배경까지 모두 출력)")
     ap.add_argument("--crop-radius", type=float, default=0.5,
                     help="자르기 반경 = 카메라-대상 거리 × 이 값 (기본 0.5, 대상이 잘리면 키움)")
@@ -60,7 +61,7 @@ def main(argv=None) -> int:
     if a.no_refine:
         cfg.refine_mesh = False
     cfg.keep_largest_component = not a.keep_all_components
-    cfg.object_centric = cfg.object_centric or a.object_centric
+    cfg.object_centric = (cfg.object_centric or a.object_centric) and not a.no_object_centric
     cfg.crop_to_focus = not a.no_crop
     cfg.crop_radius_factor = a.crop_radius
     cfg.align_up = not a.no_align

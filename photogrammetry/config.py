@@ -4,7 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 
 QUALITY_PRESETS = {
-    "turbo": dict(feature_max_image_size=1600, video_pair_matching=True, mvs_view_stride=2,
+    "turbo": dict(feature_max_image_size=1600, feature_max_num=4000, video_pair_matching=True,
+                  object_centric=True, object_min_reg_ratio=0.6, mvs_view_stride=2,
                   densify_resolution_level=2, densify_iters=2, densify_geometric_iters=1,
                   refine_mesh=False, texture_resolution_level=0, texture_max_faces=200_000,
                   texture_smoothness=1.0),
@@ -30,12 +31,15 @@ class PipelineConfig:
     single_camera: bool | None = None    # None: 해상도가 모두 같으면 True
     use_gpu: bool = True
     feature_max_image_size: int = 0      # 0 = 원본
+    feature_max_num: int = 0
     exhaustive_match_max: int = 200      # 초과 시 sequential 매칭
     sequential_overlap: int = 20
     video_pair_matching: bool = False    # 영상: 이웃·루프·희소 전역 쌍만 매칭
     video_pair_window: int = 10
     video_pair_global_stride: int = 4
     object_centric: bool = False         # 대상 주변 특징점으로 포즈 재추정
+    scout_image_size: int = 800
+    scout_max_features: int = 2000
     object_mask_radius_factor: float = 0.35
     object_min_reg_ratio: float = 0.8
     align_up: bool = True
@@ -51,6 +55,7 @@ class PipelineConfig:
     mesh_decimate: float = 1.0
     crop_to_focus: bool = True           # 촬영 대상 주변만 유지
     crop_radius_factor: float = 0.5      # 반경 = 카메라-대상 거리 × 값
+    mvs_mask: bool = True
     keep_largest_component: bool = True
     refine_mesh: bool = True
     refine_resolution_level: int = 1

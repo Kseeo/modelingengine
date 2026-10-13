@@ -9,7 +9,7 @@ import trimesh
 
 from .config import PipelineConfig
 from .plyio import points_and_colors, read_vertex_ply, write_vertex_subset
-from .sfm import camera_focus
+from .sfm import camera_focus, make_focus_masks
 from .tools import EXE, ToolError, run
 
 log = logging.getLogger(__name__)
@@ -99,8 +99,14 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
     tool("InterfaceCOLMAP", "-i", depth_dir or dense_dir, "-o", scene, "--image-folder", dense_dir / "images")
 
     log.info("[MVS 2/5] 조밀 점군 생성 (깊이맵 추정 + 융합)")
+    mask_args = []
+    if cfg.crop_to_focus and cfg.mvs_mask:
+        mask_dir = make_focus_masks(dense_dir / "sparse", dense_dir / "images", mvs / "masks",
+                                    cfg.crop_radius_factor * 1.1, mask_name=lambda n: f"{Path(n).stem}.mask.png")
+        if mask_dir is not None:
+            mask_args = ["--mask-path", mask_dir]
     dense_scene = mvs / "scene_dense.mvs"
-    tool("DensifyPointCloud", "-i", scene, "-o", dense_scene,
+    tool("DensifyPointCloud", "-i", scene, "-o", dense_scene, *mask_args,
          "--resolution-level", str(cfg.densify_resolution_level),
          "--max-resolution", str(cfg.densify_max_resolution),
          "--number-views-fuse", str(cfg.densify_number_views_fuse),
