@@ -9,6 +9,7 @@ import trimesh
 
 from .config import PipelineConfig
 from .plyio import points_and_colors, read_vertex_ply, write_vertex_subset
+from .segment import carve_by_masks
 from .sfm import camera_focus, make_focus_masks
 from .tools import EXE, ToolError, run
 
@@ -83,8 +84,10 @@ def keep_largest_component(src: Path, dst: Path) -> Path:
 
 
 def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
-            depth_dir: Path | None = None) -> tuple[Path, Path]:
-    """(텍스처 메쉬, 형상 메쉬) 반환. 형상 메쉬는 축소하지 않는다."""
+            depth_dir: Path | None = None, seg: tuple[Path, Path] | None = None,
+            mesh_hook=None) -> tuple[Path, Path]:
+    """(텍스처 메쉬, 형상 메쉬) 반환. 형상 메쉬는 축소하지 않는다.
+    seg: (깊이맵용, 투표용) 분할 마스크 폴더. mesh_hook: 텍스처 전 메쉬 교체 (2DGS 합성)."""
     mvs = work / "mvs"
     mvs.mkdir(parents=True, exist_ok=True)
     logf = work / "openmvs.log"
@@ -100,7 +103,9 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
 
     log.info("[MVS 2/5] 조밀 점군 생성 (깊이맵 추정 + 융합)")
     mask_args = []
-    if cfg.crop_to_focus and cfg.mvs_mask:
+    if seg is not None:
+        mask_args = ["--mask-path", seg[0]]
+    elif cfg.crop_to_focus and cfg.mvs_mask:
         mask_dir = make_focus_masks(dense_dir / "sparse", dense_dir / "images", mvs / "masks",
                                     cfg.crop_radius_factor * 1.1, mask_name=lambda n: f"{Path(n).stem}.mask.png")
         if mask_dir is not None:
@@ -126,6 +131,8 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
     tool("ReconstructMesh", "-i", dense_scene, "-p", dense_ply, "-o", mesh_scene,
          "--decimate", str(cfg.mesh_decimate), "--crop-to-roi", "0")
     mesh = _output_mesh(mesh_scene, ".ply")
+    if seg is not None:
+        mesh = carve_by_masks(mesh, dense_dir / "sparse", seg[1], cfg, mvs / "scene_mesh_carve.ply")
     if focus is not None:
         # 최대 성분 선택 전에 배경 제거
         mesh = crop_to_focus(mesh, focus, cfg.crop_radius_factor, mvs / "scene_mesh_crop.ply")
@@ -143,6 +150,8 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
             log.warning("메쉬 정밀화 실패, 정밀화 전 메쉬를 사용합니다: %s", str(e).splitlines()[0])
     else:
         log.info("[MVS 4/5] 메쉬 정밀화 건너뜀")
+    if mesh_hook is not None:
+        mesh = mesh_hook(mesh)
 
     if not cfg.texture:
         log.info("[MVS 5/5] 텍스처 매핑 건너뜀")

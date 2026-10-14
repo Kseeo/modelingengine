@@ -1,0 +1,15 @@
+# 분할(BiRefNet)·2DGS(gsplat) 워커용 파이썬 환경. PG_GPU_PYTHON으로 지정.
+# torch는 드라이버에 맞는 CUDA 빌드를 먼저 설치 (예: pip install torch --index-url https://download.pytorch.org/whl/cu121)
+# gsplat은 torch/CUDA 버전에 맞는 휠 (예: --index-url https://docs.gsplat.studio/whl/pt22cu121)
+torch
+gsplat
+transformers<4.50
+timm
+kornia
+einops
+scikit-image
+opencv-python-headless
+numpy<2
+scipy
+trimesh
+Pillow
