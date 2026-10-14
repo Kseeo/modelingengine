@@ -123,6 +123,34 @@ def read_cameras(cameras_bin: Path) -> dict[int, tuple[int, int, float, float, f
     return cams
 
 
+def read_camera_params(cameras_bin: Path) -> str | None:
+    """단일 카메라의 원본 파라미터 문자열 (ImageReader.camera_params 형식)."""
+    with open(cameras_bin, "rb") as f:
+        if struct.unpack("<Q", f.read(8))[0] != 1:
+            return None
+        _, model_id = struct.unpack("<ii", f.read(8))
+        f.read(16)
+        k = _CAM_NUM_PARAMS[model_id]
+        return ",".join(repr(x) for x in struct.unpack(f"<{k}d", f.read(8 * k)))
+
+
+def spread_views(images_bin: Path, keep: int) -> list[str] | None:
+    """초점 기준 촬영 방향이 고르게 퍼지도록 keep장 선택 (최원점 샘플링). 초점 없으면 None."""
+    imgs = sorted(read_images(images_bin))
+    res = camera_focus(images_bin)
+    if res is None:
+        return None
+    dirs = np.array([-r.T @ t - res[0] for _, r, t, _ in imgs])
+    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+    chosen = [0]
+    dist = 1 - dirs @ dirs[0]
+    for _ in range(keep - 1):
+        i = int(dist.argmax())
+        chosen.append(i)
+        dist = np.minimum(dist, 1 - dirs @ dirs[i])
+    return [imgs[i][0] for i in sorted(chosen)]
+
+
 def make_focus_masks(model: Path, images_dir: Path, out_dir: Path, radius_factor: float,
                      mask_name=lambda name: f"{name}.png") -> Path | None:
     """촬영 대상 주변 구를 각 프레임에 투영한 원형 마스크. 미등록 프레임은 가장 가까운 프레임 것 사용."""
@@ -202,18 +230,22 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
 
     def reconstruct_sparse(db: Path, out: Path, mask_dir: Path | None = None, tag: str = "",
                            image_size: int = cfg.feature_max_image_size, max_features: int = cfg.feature_max_num,
-                           refill_ratio: float = 0.9) -> tuple[Path | None, int]:
-        """(최대 모델, 등록 수)."""
+                           refill_ratio: float = 0.9, intrinsics: str | None = None) -> tuple[Path | None, int]:
+        """(최대 모델, 등록 수). intrinsics: 고정할 카메라 파라미터."""
         nonlocal gpu
         db.unlink(missing_ok=True)
-        mask_args = ["--ImageReader.mask_path", mask_dir] if mask_dir else []
+        reader_args = ["--ImageReader.mask_path", mask_dir] if mask_dir else []
+        if intrinsics:
+            reader_args += ["--ImageReader.camera_params", intrinsics]
+        fix_args = (["--Mapper.ba_refine_focal_length", "0", "--Mapper.ba_refine_extra_params", "0"]
+                    if intrinsics else [])
 
         def extract(use_gpu: str):
             colmap_run("feature_extractor",
                        "--database_path", db, "--image_path", images_dir,
                        "--ImageReader.camera_model", cfg.camera_model,
                        "--ImageReader.single_camera", "1" if single_camera else "0",
-                       "--FeatureExtraction.use_gpu", use_gpu, *mask_args,
+                       "--FeatureExtraction.use_gpu", use_gpu, *reader_args,
                        *(["--FeatureExtraction.max_image_size", str(image_size)] if image_size > 0 else []),
                        *(["--SiftExtraction.max_num_features", str(max_features)] if max_features > 0 else []))
 
@@ -251,7 +283,7 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
         def map_sparse():
             fresh_dir(out)
             colmap_run("mapper", "--database_path", db, "--image_path", images_dir,
-                       "--output_path", out)
+                       "--output_path", out, *fix_args)
             return _best_model(out)
 
         log.info("[SfM 3/5]%s 증분식 복원 (카메라 포즈 + 희소 점군)", tag)
@@ -274,11 +306,14 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
         if model is None:
             raise ToolError("SfM 복원 실패: 카메라 포즈를 추정하지 못했습니다.")
         mask_dir = make_focus_masks(model, images_dir, work / "masks", cfg.object_mask_radius_factor)
+        # 대상 영역만으로는 초점·왜곡이 불안정 → 초점 탐색 값 고정
+        intrinsics = read_camera_params(model / "cameras.bin") if single_camera else None
         model2, n_reg2 = None, 0
         if mask_dir is not None:
             try:
                 model2, n_reg2 = reconstruct_sparse(work / "database_obj.db", work / "sparse_obj",
-                                                    mask_dir, tag=" (대상 기준)", refill_ratio=0.8)
+                                                    mask_dir, tag=" (대상 기준)", refill_ratio=0.8,
+                                                    intrinsics=intrinsics)
             except ToolError as e:
                 log.warning("대상 기준 SfM 실패: %s", str(e).splitlines()[0])
         if model2 is not None and n_reg2 >= cfg.object_min_reg_ratio * n_reg:
@@ -318,7 +353,9 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
     if cfg.mvs_view_stride > 1:
         # 깊이맵용 부분 모델 (텍스처는 전체 사용)
         reg = sorted(read_image_names(dense / "sparse" / "images.bin"))
-        drop = [n for i, n in enumerate(reg) if i % cfg.mvs_view_stride]
+        keep = spread_views(dense / "sparse" / "images.bin", -(-len(reg) // cfg.mvs_view_stride))
+        keep = set(keep) if keep else set(reg[::cfg.mvs_view_stride])
+        drop = [n for n in reg if n not in keep]
         if len(reg) - len(drop) >= cfg.min_images:
             drop_file = work / "mvs_dropped_images.txt"
             drop_file.write_text("\n".join(drop) + "\n", encoding="utf-8")
