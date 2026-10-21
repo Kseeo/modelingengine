@@ -1,16 +1,21 @@
-# modelingengine — 2D 영상/이미지 → 3D (GLB, STL)
+# modelingengine — 2D 영상/이미지 → 3D 발 메쉬 (GLB, STL)
 
-SfM–MVS 포토그래메트리(Structure-from-Motion + Multi-View Stereo) 모듈.
-학습 기반 생성이 아닌 고전 다중뷰 기하학으로, 형상 사전지식 없이 **사진에 찍힌 것만** 복원합니다.
+SfM(COLMAP) + MVS(OpenMVS) + 2DGS(gsplat) 합성 파이프라인.
+MVS는 사진으로 직접 삼각측량해 **큰 곡률(아치·발등)**이 실제에 가깝고, 2DGS는 텍스처 없는 피부에서도
+**매끈하고 구멍 없는 표면**을 만듭니다. 두 메쉬를 합성해 양쪽 장점을 함께 씁니다.
 
 ```
-영상(30~60초) ─ 0.5초당 1장 ─┐
-                              ├─ [SfM · COLMAP]  SIFT 특징점 → 매칭 → 카메라 포즈 역산 + 희소 점군
-이미지 폴더(20장+) ───────────┘        → 위쪽 방향 정렬 → 왜곡 보정(PINHOLE)
-                                  [MVS · OpenMVS] 깊이맵 삼각측량 → 조밀 점군 → 표면 메쉬
-                                        → 촬영 대상 주변 자르기 → 부유 조각 제거 → 광도 기반 정밀화 → 텍스처 매핑
-                                  [Export] GLB(텍스처, Y-up) / STL(형상, Z-up)
+영상(30~60초) ─ 0.5초당 최선명 1장 ─┐
+                                     ├─ [SfM · COLMAP] SIFT → 영상 쌍 매칭 → 초점거리 보정 → 전역 복원
+이미지 폴더(20장+) ──────────────────┘     (결과 부족 시 증분식과 비교) → 위쪽 정렬 → 왜곡 보정
+            [분할 · BiRefNet, GPU]  SfM과 병렬로 프레임별 발 마스크
+            [Dense]  OpenMVS(CPU) 깊이맵 → 메쉬  ∥  2DGS(GPU) hull 초기화 → 학습 → TSDF 메쉬
+            [합성]   2DGS 메쉬에 MVS 큰 곡률 반영 → MVS 근거 없이 hull에 붙은 덩어리 재보간
+                     → OpenMVS 텍스처 매핑
+            [Export] GLB(텍스처, Y-up) / STL·PLY(형상, Z-up)
 ```
+
+2DGS가 실패하거나 `gs_timeout_sec`(300초)를 넘기면 MVS 메쉬로, 분할이 실패하면 원형 마스크로 자동 폴백합니다.
 
 ## 설치
 
@@ -20,7 +25,15 @@ python scripts/install_tools.py          # COLMAP 4.2.0(CUDA) + OpenMVS 2.4.0 �
 python scripts/install_tools.py --nocuda # GPU 없는 PC
 ```
 
-다른 위치에 설치된 도구를 쓰려면 환경변수 `COLMAP_PATH`(colmap 실행 파일), `OPENMVS_DIR`(OpenMVS 폴더)를 지정합니다.
+분할과 2DGS는 CUDA torch가 있는 파이썬에서 별도 프로세스로 실행합니다. 같은 환경이면 그대로 쓰고,
+다른 환경(예: conda)이면 그 파이썬 경로를 `PG_GPU_PYTHON`에 지정합니다.
+
+```bash
+pip install -r requirements-gpu.txt      # GPU 파이썬 환경에서
+export PG_GPU_PYTHON=/path/to/gpu-env/python
+```
+
+다른 위치에 설치된 도구를 쓰려면 `COLMAP_PATH`(colmap 실행 파일), `OPENMVS_DIR`(OpenMVS 폴더)를 지정합니다.
 
 ## 사용
 
@@ -33,37 +46,20 @@ python -m photogrammetry data/foot.mp4 --quality high --scale 1.0 -o output/foot
 
 | 옵션 | 설명 |
 |---|---|
-| `--quality turbo/fast/normal/high` | 속도·품질 프리셋 (기본 `turbo`, 아래 표) |
+| `--quality turbo/fast/normal/high` | 속도·품질 프리셋 (기본 `turbo`) |
 | `--formats glb,stl,ply` | 출력 형식 (기본 3종, obj도 가능) |
 | `--scale` | 출력 배율. SfM 결과는 절대 크기를 모르므로 실측 기준으로 보정 |
-| `--interval 0.5` | 영상 프레임 추출 간격(초) |
-| `--no-sharpest` | 0.5초 구간 내 최선명 프레임 대신 구간 시작 프레임 사용 |
-| `--no-texture` / `--no-refine` | 텍스처 매핑 / 메쉬 정밀화 생략 |
-| `--no-crop` | 촬영 대상 주변 자르기 끄기 (방·바닥 등 배경까지 출력) |
-| `--crop-radius 0.5` | 자르기 반경 = 카메라-대상 거리 × 값. 대상 일부가 잘리면 키움 |
-| `--keep-all-components` | 가장 큰 덩어리 외의 조각도 유지 |
-| `--cpu` | COLMAP GPU 사용 안 함 |
-| `--clean` | 완료 후 중간 작업 폴더 삭제 |
 | `-v` | COLMAP/OpenMVS 출력까지 표시 |
 
-### 품질 프리셋 (53초 영상 → 107프레임, i7-13700F CPU 전용 실측)
-
-| 프리셋 | 시간 | 내용 |
-|---|---|---|
-| `turbo` | **2.6분** | 영상 쌍 매칭(이웃+루프+희소 전역, 전체의 ~24%), 특징점 1600px, MVS는 2장 중 1장, 기하 반복 1회, 텍스처용 메쉬 20만 면 축소 (STL은 축소 전 메쉬) |
-| `fast` | 18.9분 | 전체 쌍 매칭, 전체 프레임 MVS, 정밀화 없음 |
-| `normal` | 더 김 | + 메쉬 정밀화 |
-| `high` | 가장 김 | 원본 해상도 깊이맵 |
-
-`turbo` 단계별: 프레임 추출 34초 / SfM 54초 / MVS 69초 / 내보내기 2초.
-영상 쌍 매칭 후 등록률이 90% 미만이면 남은 쌍을 자동으로 추가 매칭해 재복원합니다 (끊긴 구간 연결).
-GPU(CUDA)가 동작하면 SfM·깊이맵이 추가로 빨라집니다 (NVIDIA 드라이버가 COLMAP 빌드의 CUDA 버전을 지원해야 함).
+`turbo` 실측 (개발 PC: i7-13700F, RTX 4070, COLMAP·OpenMVS는 CPU 경로, 영상 5개):
+전체 190~247초. 입력 20~45초 / SfM(분할 대기 포함) 32~58초 / Dense+합성+텍스처 124~152초.
+현재 가장 오래 걸리는 단계는 2DGS 학습(약 85초, `gs_iters` 6000)입니다.
 
 Python에서:
 
 ```python
 from photogrammetry import reconstruct, PipelineConfig
-report = reconstruct("data/foot.mp4", "output/foot", config=PipelineConfig(densify_resolution_level=0))
+report = reconstruct("data/foot.mp4", "output/foot", config=PipelineConfig.preset("turbo", dense_method="mvs"))
 ```
 
 ## 출력
@@ -71,23 +67,20 @@ report = reconstruct("data/foot.mp4", "output/foot", config=PipelineConfig(densi
 `output/<이름>/`
 - `<이름>.glb` — 텍스처 포함, glTF 규약 Y-up
 - `<이름>.stl` — 형상만, Z-up, 바닥이 z=0
-- `<이름>.ply` — STL과 같은 형상 + 정점 색 (조밀 점군 색을 가까운 4점 역거리 가중으로 매핑)
-- `<이름>_report.json` — 등록 이미지 수, 점/면 수, 크기, 설정값, 작업 폴더 경로
+- `<이름>.ply` — STL과 같은 형상 + 정점 색
+- `<이름>_report.json` — 등록 이미지 수, 단계별 시간, 합성 통계(`dense`: MVS 근거·재보간 비율), 설정값
 
-중간 산출물(프레임, COLMAP DB, 희소/조밀 모델, 로그)은 작업 폴더에 남습니다. 출력 경로에 한글·공백이 있으면
-COLMAP/OpenMVS 호환을 위해 작업 폴더를 `%TEMP%\pg_work\` 아래에 만듭니다 (`PG_WORK_ROOT`로 변경 가능).
+작업 폴더(프레임, COLMAP DB, 모델, 로그)는 **성공하면 삭제, 실패하면 보존**합니다(`keep_workspace`).
+출력 경로에 한글·공백이 있으면 작업 폴더를 `%TEMP%\pg_work\` 아래에 만듭니다(`PG_WORK_ROOT`로 변경 가능).
 
 ## 촬영 가이드
 
-- 대상 주위를 천천히 한 바퀴 이상 돌며 촬영 (인접 프레임 간 60~80% 겹침)
-- 높이를 바꿔 2바퀴(위에서/옆에서) 찍으면 윗면·옆면이 모두 복원됨
-- 흐림(모션 블러), 역광, 반사·투명·무늬 없는 표면은 매칭 실패 원인
-- 대상이 아닌 배경(바닥 등)도 사진에 찍힌 만큼 함께 복원됨. 기본으로 **모든 카메라 광축이 가장 가깝게 모이는 점**(= 화면 중앙에 두고 찍은 대상)
-  주변만 남기므로, 대상을 화면 가운데에 두고 찍을 것. 무늬 있는 바닥 위에서 찍으면 SfM은 안정적이며,
-  바닥이 대상과 붙어 복원되면 후처리로 잘라내야 함
+- 발을 화면 가운데에 두고 주위를 천천히 한 바퀴 이상 돌며 촬영 (인접 프레임 간 60~80% 겹침)
+- 종아리를 받치고 발 전체를 띄울 것 — 뒤꿈치를 받침대에 올리면 뒤꿈치 바닥이 복원되지 않음
+- 흐림(모션 블러), 역광, 무늬 없는 배경은 SfM 실패 원인
 
 ## 한계
 
-- **스케일**: 단안 SfM은 절대 크기를 알 수 없음 → 크기를 아는 물체(자, 마커)를 함께 찍고 `--scale`로 보정
-- **위쪽 방향**: 촬영 시 카메라를 똑바로 세웠다는 가정으로 정렬 (`--no-align`으로 끔)
-- STL은 스캔 메쉬 그대로라 구멍이 있을 수 있음 (`report.json`의 `watertight`)
+- **스케일**: 단안 SfM은 절대 크기를 알 수 없음 → `--scale`로 후보정
+- **재보간 영역**: MVS 근거 없이 hull에 붙은 2DGS 표면은 주변 곡면으로 보간한 추정값 (`report.json`의 `dense.refilled`)
+- 피부·배경이 모두 밋밋한 영상은 MVS 근거가 부족해 합성 품질이 떨어짐

@@ -23,6 +23,7 @@ class SfmResult:
     num_points: int
     aligned_up: bool
     depth_dir: Path | None = None  # 깊이맵용 부분 모델 (None이면 dense_dir)
+    model_dir: Path | None = None  # 왜곡 보정 전 모델
 
 
 def _count_bin(path: Path) -> int:
@@ -106,8 +107,8 @@ def camera_focus(images_bin: Path) -> tuple[np.ndarray, float] | None:
 _CAM_NUM_PARAMS = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8, 5: 8, 6: 12, 7: 5, 8: 4, 9: 5, 10: 12, 11: 16}
 
 
-def read_cameras(cameras_bin: Path) -> dict[int, tuple[int, int, float, float, float, float]]:
-    """camera_id → (width, height, fx, fy, cx, cy)."""
+def read_camera_models(cameras_bin: Path) -> dict[int, tuple[int, int, int, tuple[float, ...]]]:
+    """camera_id → (model_id, width, height, params)."""
     cams = {}
     with open(cameras_bin, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
@@ -115,11 +116,18 @@ def read_cameras(cameras_bin: Path) -> dict[int, tuple[int, int, float, float, f
             cam_id, model_id = struct.unpack("<ii", f.read(8))
             w, h = struct.unpack("<QQ", f.read(16))
             k = _CAM_NUM_PARAMS[model_id]
-            p = struct.unpack(f"<{k}d", f.read(8 * k))
-            if model_id in (0, 2, 3, 7, 8, 9):  # 단일 초점거리 모델
-                cams[cam_id] = (w, h, p[0], p[0], p[1], p[2])
-            else:
-                cams[cam_id] = (w, h, p[0], p[1], p[2], p[3])
+            cams[cam_id] = (model_id, w, h, struct.unpack(f"<{k}d", f.read(8 * k)))
+    return cams
+
+
+def read_cameras(cameras_bin: Path) -> dict[int, tuple[int, int, float, float, float, float]]:
+    """camera_id → (width, height, fx, fy, cx, cy)."""
+    cams = {}
+    for cam_id, (model_id, w, h, p) in read_camera_models(cameras_bin).items():
+        if model_id in (0, 2, 3, 7, 8, 9):  # 단일 초점거리 모델
+            cams[cam_id] = (w, h, p[0], p[0], p[1], p[2])
+        else:
+            cams[cam_id] = (w, h, p[0], p[1], p[2], p[3])
     return cams
 
 
@@ -178,117 +186,122 @@ def video_pairs(names: list[str], window: int, global_stride: int) -> list[tuple
     return [(names[i], names[j]) for i, j in sorted(pairs) if i != j]
 
 
+def _poses_ok(model: Path | None, n_reg: int, num_input: int) -> bool:
+    """등록률 80% 이상 + 카메라들이 한 대상을 향함."""
+    return model is not None and n_reg >= 0.8 * num_input and camera_focus(model / "images.bin") is not None
+
+
 def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
             single_camera: bool, ordered: bool = False) -> SfmResult:
     """ordered: 파일명 순서 = 촬영 순서 (영상)."""
     bin_dir = colmap.parent
     logf = work / "colmap.log"
     db = work / "database.db"
-    sparse = work / "sparse"
     dense = work / "dense"
-    for p in (db, sparse, dense, work / "dense_depth"):
+    for p in [db, work / "database_cal.db", dense, work / "dense_depth", *work.glob("sparse*")]:
         if p.is_dir():
             shutil.rmtree(p)
         elif p.exists():
             p.unlink()
-    sparse.mkdir(parents=True)
     num_input = sum(1 for _ in images_dir.iterdir())
     gpu = "1" if cfg.use_gpu else "0"
+    used_pairs = ordered and cfg.video_pair_matching
 
     def colmap_run(*args):
         run([colmap, *args], cwd=work, log_file=logf, env_path=bin_dir)
 
-    used_pairs = ordered and cfg.video_pair_matching
+    def extract(use_gpu: str):
+        colmap_run("feature_extractor",
+                   "--database_path", db, "--image_path", images_dir,
+                   "--ImageReader.camera_model", cfg.camera_model,
+                   "--ImageReader.single_camera", "1" if single_camera else "0",
+                   "--FeatureExtraction.use_gpu", use_gpu,
+                   *(["--FeatureExtraction.max_image_size", str(cfg.feature_max_image_size)]
+                     if cfg.feature_max_image_size > 0 else []),
+                   *(["--SiftExtraction.max_num_features", str(cfg.feature_max_num)]
+                     if cfg.feature_max_num > 0 else []))
 
-    def reconstruct_sparse(db: Path, out: Path, mask_dir: Path | None = None, tag: str = "",
-                           image_size: int = cfg.feature_max_image_size, max_features: int = cfg.feature_max_num,
-                           refill_ratio: float = 0.9) -> tuple[Path | None, int]:
-        """(최대 모델, 등록 수)."""
-        nonlocal gpu
+    log.info("[SfM 1/5] 특징점 추출 (SIFT, %s)", "GPU" if gpu == "1" else "CPU")
+    try:
+        extract(gpu)
+    except ToolError as e:
+        if gpu == "0":
+            raise
+        log.warning("GPU 특징점 추출 실패 → CPU로 재시도 (느림). GPU 드라이버 업데이트를 권장합니다.\n  %s",
+                    str(e).splitlines()[-1])
+        gpu = "0"
         db.unlink(missing_ok=True)
-        mask_args = ["--ImageReader.mask_path", mask_dir] if mask_dir else []
+        extract(gpu)
 
-        def extract(use_gpu: str):
-            colmap_run("feature_extractor",
-                       "--database_path", db, "--image_path", images_dir,
-                       "--ImageReader.camera_model", cfg.camera_model,
-                       "--ImageReader.single_camera", "1" if single_camera else "0",
-                       "--FeatureExtraction.use_gpu", use_gpu, *mask_args,
-                       *(["--FeatureExtraction.max_image_size", str(image_size)] if image_size > 0 else []),
-                       *(["--SiftExtraction.max_num_features", str(max_features)] if max_features > 0 else []))
-
-        log.info("[SfM 1/5]%s 특징점 추출 (SIFT, %s)", tag, "GPU" if gpu == "1" else "CPU")
-        try:
-            extract(gpu)
-        except ToolError as e:
-            if gpu == "0":
-                raise
-            log.warning("GPU 특징점 추출 실패 → CPU로 재시도 (느림). GPU 드라이버 업데이트를 권장합니다.\n  %s",
-                        str(e).splitlines()[-1])
-            gpu = "0"
-            db.unlink(missing_ok=True)
-            extract(gpu)
-
-        if used_pairs:
-            names = sorted(p.name for p in images_dir.iterdir())
-            pairs = video_pairs(names, cfg.video_pair_window, cfg.video_pair_global_stride)
-            pair_file = work / "match_pairs.txt"
-            pair_file.write_text("".join(f"{a} {b}\n" for a, b in pairs), encoding="utf-8")
-            log.info("[SfM 2/5]%s 특징점 매칭 (영상 쌍 %d개 = 전체의 %.0f%%, %d장)", tag,
-                     len(pairs), 100 * len(pairs) / max(1, num_input * (num_input - 1) // 2), num_input)
-            colmap_run("matches_importer", "--database_path", db, "--match_list_path", pair_file,
-                       "--match_type", "pairs", "--FeatureMatching.use_gpu", gpu)
-        elif num_input <= cfg.exhaustive_match_max:
-            log.info("[SfM 2/5]%s 특징점 매칭 (exhaustive, %d장)", tag, num_input)
-            colmap_run("exhaustive_matcher", "--database_path", db,
-                       "--FeatureMatching.use_gpu", gpu)
-        else:
-            log.info("[SfM 2/5]%s 특징점 매칭 (sequential, %d장)", tag, num_input)
-            colmap_run("sequential_matcher", "--database_path", db,
-                       "--FeatureMatching.use_gpu", gpu,
-                       "--SequentialMatching.overlap", str(cfg.sequential_overlap))
-
-        def map_sparse():
-            fresh_dir(out)
-            colmap_run("mapper", "--database_path", db, "--image_path", images_dir,
-                       "--output_path", out)
-            return _best_model(out)
-
-        log.info("[SfM 3/5]%s 증분식 복원 (카메라 포즈 + 희소 점군)", tag)
-        try:
-            model, n_reg = map_sparse()
-        except ToolError:
-            if not used_pairs:
-                raise
-            model, n_reg = None, 0
-        if used_pairs and n_reg < refill_ratio * num_input:
-            # 끊긴 구간 연결: 남은 쌍 추가 매칭
-            log.warning("영상 쌍 매칭으로 %d / %d장만 등록 → 나머지 쌍을 추가 매칭 후 재복원", n_reg, num_input)
-            colmap_run("exhaustive_matcher", "--database_path", db, "--FeatureMatching.use_gpu", gpu)
-            model, n_reg = map_sparse()
-        return model, n_reg
-
-    if cfg.object_centric:
-        model, n_reg = reconstruct_sparse(db, sparse, tag=" (초점 탐색)", image_size=cfg.scout_image_size,
-                                          max_features=cfg.scout_max_features, refill_ratio=0.5)
-        if model is None:
-            raise ToolError("SfM 복원 실패: 카메라 포즈를 추정하지 못했습니다.")
-        mask_dir = make_focus_masks(model, images_dir, work / "masks", cfg.object_mask_radius_factor)
-        model2, n_reg2 = None, 0
-        if mask_dir is not None:
-            try:
-                model2, n_reg2 = reconstruct_sparse(work / "database_obj.db", work / "sparse_obj",
-                                                    mask_dir, tag=" (대상 기준)", refill_ratio=0.8)
-            except ToolError as e:
-                log.warning("대상 기준 SfM 실패: %s", str(e).splitlines()[0])
-        if model2 is not None and n_reg2 >= cfg.object_min_reg_ratio * n_reg:
-            log.info("대상 기준 포즈 사용: 등록 %d장 (초점 탐색 %d장)", n_reg2, n_reg)
-            model, n_reg = model2, n_reg2
-        else:
-            log.warning("대상 기준 등록 부족 (%d vs %d장) → 배경 기준 SfM 재실행", n_reg2, n_reg)
-            model, n_reg = reconstruct_sparse(db, sparse)
+    if used_pairs:
+        names = sorted(p.name for p in images_dir.iterdir())
+        pairs = video_pairs(names, cfg.video_pair_window, cfg.video_pair_global_stride)
+        pair_file = work / "match_pairs.txt"
+        pair_file.write_text("".join(f"{a} {b}\n" for a, b in pairs), encoding="utf-8")
+        log.info("[SfM 2/5] 특징점 매칭 (영상 쌍 %d개 = 전체의 %.0f%%, %d장)",
+                 len(pairs), 100 * len(pairs) / max(1, num_input * (num_input - 1) // 2), num_input)
+        colmap_run("matches_importer", "--database_path", db, "--match_list_path", pair_file,
+                   "--match_type", "pairs", "--FeatureMatching.use_gpu", gpu)
+    elif num_input <= cfg.exhaustive_match_max:
+        log.info("[SfM 2/5] 특징점 매칭 (exhaustive, %d장)", num_input)
+        colmap_run("exhaustive_matcher", "--database_path", db, "--FeatureMatching.use_gpu", gpu)
     else:
-        model, n_reg = reconstruct_sparse(db, sparse)
+        log.info("[SfM 2/5] 특징점 매칭 (sequential, %d장)", num_input)
+        colmap_run("sequential_matcher", "--database_path", db, "--FeatureMatching.use_gpu", gpu,
+                   "--SequentialMatching.overlap", str(cfg.sequential_overlap))
+
+    def incremental(out: Path) -> tuple[Path, int]:
+        fresh_dir(out)
+        colmap_run("mapper", "--database_path", db, "--image_path", images_dir, "--output_path", out)
+        return _best_model(out)
+
+    def global_(out: Path, calibrate: bool = False) -> tuple[Path, int]:
+        use_db = db
+        if calibrate:
+            # 초점거리 정보 없는 영상 대비. 보정이 DB를 수정하므로 복사본에서
+            use_db = work / "database_cal.db"
+            shutil.copy2(db, use_db)
+            colmap_run("view_graph_calibrator", "--database_path", use_db)
+        fresh_dir(out)
+        colmap_run("global_mapper", "--database_path", use_db, "--image_path", images_dir, "--output_path", out)
+        return _best_model(out)
+
+    def map_sparse(root: str) -> tuple[Path | None, int]:
+        if cfg.sfm_mapper != "global":
+            return incremental(work / root)
+        # 전역 → (부족 시) 증분식 → (부족 시) 초점거리 보정 후 전역, 등록 수 최대 결과 사용
+        tries = [("전역", lambda: global_(work / root)), ("증분식", lambda: incremental(work / f"{root}_inc")),
+                 ("보정 후 전역", lambda: global_(work / f"{root}_cal", calibrate=True))]
+        best, best_n = None, 0
+        for name, attempt in tries:
+            try:
+                model, n = attempt()
+            except ToolError as e:
+                log.warning("%s 복원 실패: %s", name, str(e).splitlines()[0])
+                continue
+            if n > best_n:
+                best, best_n = model, n
+            if _poses_ok(model, n, num_input):
+                break
+            log.warning("%s 복원 결과 부족 (%d / %d장) → 다음 방법 시도", name, n, num_input)
+        if best is not None:
+            log.info("포즈 결과: %d / %d장", best_n, num_input)
+        return best, best_n
+
+    log.info("[SfM 3/5] %s 복원 (카메라 포즈 + 희소 점군)", "전역" if cfg.sfm_mapper == "global" else "증분식")
+    try:
+        model, n_reg = map_sparse("sparse")
+    except ToolError:
+        if not used_pairs:
+            raise
+        model, n_reg = None, 0
+    if used_pairs and n_reg < 0.9 * num_input:
+        # 끊긴 구간 연결: 남은 쌍 추가 매칭 후 재복원, 더 많이 등록된 쪽 사용
+        log.warning("영상 쌍 매칭으로 %d / %d장만 등록 → 나머지 쌍을 추가 매칭 후 재복원", n_reg, num_input)
+        colmap_run("exhaustive_matcher", "--database_path", db, "--FeatureMatching.use_gpu", gpu)
+        model2, n2 = map_sparse("sparse_full")
+        if n2 > n_reg:
+            model, n_reg = model2, n2
     if model is None:
         raise ToolError("SfM 복원 실패: 카메라 포즈를 추정하지 못했습니다.")
 
@@ -333,4 +346,6 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
 
     n_pts = _count_bin(dense / "sparse" / "points3D.bin")
     log.info("희소 점군: %d points", n_pts)
-    return SfmResult(dense, num_input, n_reg, n_pts, aligned, depth_dir)
+    return SfmResult(dense, num_input, n_reg, n_pts, aligned, depth_dir, model)
+
+

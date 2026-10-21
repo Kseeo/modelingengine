@@ -14,6 +14,8 @@ from . import inputs
 from .config import PipelineConfig
 from .export import export_models
 from .mvs import run_mvs
+from .fuse import GsJob, fuse
+from .segment import SegmentJob, undistort_masks
 from .sfm import run_sfm
 from .tools import find_colmap, find_openmvs_dir, fresh_dir
 
@@ -73,11 +75,47 @@ def reconstruct(input_path: str | Path, output_dir: str | Path, name: str | None
 
     timings = {"input": round(time.time() - t0, 1)}
     log.info("=== [2/4] SfM: 카메라 포즈 추정 ===")
-    sfm = run_sfm(colmap, images_dir, work, cfg, single_camera, ordered=(kind == "video"))
+    seg = SegmentJob(images_dir, work / "seg_raw", cfg, work / "segment.log") if cfg.seg_masks else None
+    try:
+        sfm = run_sfm(colmap, images_dir, work, cfg, single_camera, ordered=(kind == "video"))
+        seg_raw = seg.wait() if seg else None
+    except BaseException:
+        if seg:
+            seg.cancel()
+        raise
 
     timings["sfm"] = round(time.time() - t0 - sum(timings.values()), 1)
-    log.info("=== [3/4] MVS: 조밀 복원 + 메쉬 + 텍스처 ===")
-    mesh_path, shape_path = run_mvs(openmvs, sfm.dense_dir, work, cfg, sfm.depth_dir)
+    seg_dirs = undistort_masks(seg_raw, sfm.model_dir, sfm.dense_dir, work / "seg", cfg) if seg_raw else None
+    gs = None
+    if cfg.dense_method == "fused":
+        if seg_dirs is None:
+            log.warning("분할 마스크가 없어 2DGS 합성을 건너뜁니다 (MVS만 사용).")
+        else:
+            gs = GsJob(sfm.dense_dir, seg_dirs[1], work, cfg)
+    fusion = {"method": "mvs"}
+
+    def fuse_hook(mvs_mesh: Path) -> Path:
+        res = gs.wait()
+        if gs.hull_check:
+            fusion["hull_check"] = gs.hull_check
+        if res is None:
+            return mvs_mesh
+        try:
+            fused, stats = fuse(Path(res["shape"]), mvs_mesh, work / "mvs" / "scene_mesh_fused.ply", cfg,
+                                Path(res["hull"]) if res.get("hull") else None, res.get("hull_voxel", 0.0))
+        except Exception as e:  # noqa: BLE001
+            log.warning("합성 실패 → MVS 메쉬 사용: %s", e)
+            return mvs_mesh
+        fusion.update(method="fused", gs_sec=res.get("total_sec"), gs_timings=res.get("timings_sec"), **stats)
+        return fused
+
+    log.info("=== [3/4] Dense: MVS%s + 메쉬 + 텍스처 ===", " ∥ 2DGS 합성" if gs else "")
+    try:
+        mesh_path, shape_path = run_mvs(openmvs, sfm.dense_dir, work, cfg, sfm.depth_dir, seg_dirs,
+                                        fuse_hook if gs else None)
+    finally:
+        if gs:
+            gs.cancel()
 
     timings["mvs"] = round(time.time() - t0 - sum(timings.values()), 1)
     log.info("=== [4/4] 내보내기 ===")
@@ -93,6 +131,8 @@ def reconstruct(input_path: str | Path, output_dir: str | Path, name: str | None
         "images_registered": sfm.num_registered,
         "sparse_points": sfm.num_points,
         "up_aligned": sfm.aligned_up,
+        "seg_masks": seg_raw is not None,
+        "dense": fusion,
         "mesh": info,
         "units": "임의 단위 (SfM은 절대 스케일을 모름. --scale로 보정)" if cfg.scale == 1.0 else f"scale x{cfg.scale}",
         "workspace": str(work) if cfg.keep_workspace else None,

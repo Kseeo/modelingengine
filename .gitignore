@@ -3,3 +3,4 @@ output/
 data/*
 !data/README.md
 __pycache__/
+api_key.txt
