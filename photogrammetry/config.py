@@ -4,7 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 
 QUALITY_PRESETS = {
-    "turbo": dict(feature_max_image_size=1600, video_pair_matching=True, mvs_view_stride=2,
+    "turbo": dict(feature_max_image_size=800, feature_max_num=2000, video_pair_matching=True,
+                  mvs_view_stride=2,
                   densify_resolution_level=2, densify_iters=2, densify_geometric_iters=1,
                   refine_mesh=False, texture_resolution_level=0, texture_max_faces=200_000,
                   texture_smoothness=1.0),
@@ -30,17 +31,36 @@ class PipelineConfig:
     single_camera: bool | None = None    # None: 해상도가 모두 같으면 True
     use_gpu: bool = True
     feature_max_image_size: int = 0      # 0 = 원본
+    feature_max_num: int = 0
     exhaustive_match_max: int = 200      # 초과 시 sequential 매칭
     sequential_overlap: int = 20
     video_pair_matching: bool = False    # 영상: 이웃·루프·희소 전역 쌍만 매칭
     video_pair_window: int = 10
     video_pair_global_stride: int = 4
-    object_centric: bool = False         # 대상 주변 특징점으로 포즈 재추정
-    object_mask_radius_factor: float = 0.35
-    object_min_reg_ratio: float = 0.8
+    sfm_mapper: str = "global"           # global | incremental (global 결과 부족 시 incremental과 비교)
     align_up: bool = True
     undistort_max_size: int = 3200
     mvs_view_stride: int = 1             # 깊이맵에 N장 중 1장 사용
+
+    # ---- 분할 마스크 (BiRefNet) ----
+    seg_masks: bool = True
+    seg_model: str = "ZhengPeng7/BiRefNet"
+    seg_size: int = 1024
+    seg_threshold: float = 0.3           # 깊이맵용 (넉넉하게)
+    seg_dilate: float = 0.03             # 깊이맵용 팽창 (긴 변 대비)
+    seg_vote_ratio: float = 0.8          # 마스크 안 비율이 이 미만인 정점 제거 (0.9부터 발 표면 손실)
+    seg_vote_min_views: int = 5          # 이보다 적게 보인 정점은 유지
+    seg_vote_margin: int = 4             # 투표 마스크 경계 허용 (px)
+
+    # ---- Dense: 2DGS 마감 + MVS 곡률 합성 ----
+    gpu_python: str = ""                 # 분할·2DGS용 (torch CUDA). 빈 값: PG_GPU_PYTHON 환경 변수
+    dense_method: str = "fused"          # fused | mvs (2DGS 실패·시간 초과 시 mvs)
+    gs_iters: int = 6000
+    gs_max_views: int = 60               # 학습 뷰 수 (메쉬 융합은 전체 사용)
+    gs_image_size: int = 960             # 학습 해상도 (긴 변)
+    gs_timeout_sec: float = 300.0
+    fuse_lambda: float = 30.0            # 클수록 MVS 곡률을 넓게 평활해 반영
+    fuse_support_tol: float = 0.01       # MVS 근거 거리 (대각 비율)
 
     # ---- MVS (OpenMVS) ----
     densify_resolution_level: int = 1    # 0=원본, 1=1/2, 2=1/4
@@ -51,6 +71,7 @@ class PipelineConfig:
     mesh_decimate: float = 1.0
     crop_to_focus: bool = True           # 촬영 대상 주변만 유지
     crop_radius_factor: float = 0.5      # 반경 = 카메라-대상 거리 × 값
+    mvs_mask: bool = True
     keep_largest_component: bool = True
     refine_mesh: bool = True
     refine_resolution_level: int = 1
@@ -65,7 +86,7 @@ class PipelineConfig:
     formats: list[str] = field(default_factory=lambda: ["glb", "stl", "ply"])
     scale: float = 1.0
     place_on_ground: bool = True
-    keep_workspace: bool = True
+    keep_workspace: bool = False         # 성공 시 작업 폴더 삭제 (실패 시 보존)
 
     @classmethod
     def preset(cls, quality: str, **overrides) -> PipelineConfig:

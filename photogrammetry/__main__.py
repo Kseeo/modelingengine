@@ -31,19 +31,6 @@ def main(argv=None) -> int:
     ap.add_argument("--quality", choices=QUALITY_PRESETS, default="turbo", help="기본 turbo")
     ap.add_argument("--formats", default="glb,stl,ply", help="쉼표 구분: glb,stl,ply(정점 색),obj")
     ap.add_argument("--scale", type=float, default=1.0, help="출력 배율 (SfM 결과는 임의 스케일)")
-    ap.add_argument("--interval", type=float, default=0.5, help="영상 프레임 추출 간격(초)")
-    ap.add_argument("--no-sharpest", action="store_true", help="구간 내 최선명 프레임 선택 대신 구간 시작 프레임 사용")
-    ap.add_argument("--no-texture", action="store_true")
-    ap.add_argument("--no-refine", action="store_true")
-    ap.add_argument("--keep-all-components", action="store_true", help="떠다니는 조각을 제거하지 않음")
-    ap.add_argument("--object-centric", action="store_true",
-                    help="대상 주변 특징점만으로 포즈 재추정 (촬영 중 발이 움직인 영상 보정, SfM 1회 추가)")
-    ap.add_argument("--no-crop", action="store_true", help="촬영 대상 주변 자르기 끄기 (배경까지 모두 출력)")
-    ap.add_argument("--crop-radius", type=float, default=0.5,
-                    help="자르기 반경 = 카메라-대상 거리 × 이 값 (기본 0.5, 대상이 잘리면 키움)")
-    ap.add_argument("--no-align", action="store_true", help="위쪽 방향 자동 정렬 끄기")
-    ap.add_argument("--cpu", action="store_true", help="COLMAP GPU 사용 안 함")
-    ap.add_argument("--clean", action="store_true", help="완료 후 중간 작업 폴더 삭제")
     ap.add_argument("-v", "--verbose", action="store_true", help="외부 도구 출력까지 표시")
     a = ap.parse_args(argv)
 
@@ -54,18 +41,6 @@ def main(argv=None) -> int:
     cfg = PipelineConfig.preset(a.quality)
     cfg.formats = [f.strip() for f in a.formats.split(",") if f.strip()]
     cfg.scale = a.scale
-    cfg.frame_interval_sec = a.interval
-    cfg.pick_sharpest = not a.no_sharpest
-    cfg.texture = not a.no_texture
-    if a.no_refine:
-        cfg.refine_mesh = False
-    cfg.keep_largest_component = not a.keep_all_components
-    cfg.object_centric = cfg.object_centric or a.object_centric
-    cfg.crop_to_focus = not a.no_crop
-    cfg.crop_radius_factor = a.crop_radius
-    cfg.align_up = not a.no_align
-    cfg.use_gpu = not a.cpu
-    cfg.keep_workspace = not a.clean
 
     if a.input:
         targets = [Path(a.input)]

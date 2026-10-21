@@ -9,3 +9,4 @@ uvicorn[standard]
 python-multipart
 # 아이폰 HEIC 사진을 쓸 경우
 # pillow-heif
+# 분할·2DGS용 GPU 환경은 requirements-gpu.txt
