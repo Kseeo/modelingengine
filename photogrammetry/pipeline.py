@@ -96,6 +96,8 @@ def reconstruct(input_path: str | Path, output_dir: str | Path, name: str | None
 
     def fuse_hook(mvs_mesh: Path) -> Path:
         res = gs.wait()
+        if gs.hull_check:
+            fusion["hull_check"] = gs.hull_check
         if res is None:
             return mvs_mesh
         try:

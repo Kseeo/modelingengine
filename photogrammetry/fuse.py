@@ -25,6 +25,8 @@ from .tools import PROJECT_ROOT, fresh_dir
 
 log = logging.getLogger(__name__)
 
+FUSE_SCREEN = 0.05  # 근거 없는 정점 오프셋 감쇠 가중치
+
 
 
 class GsJob:
@@ -35,6 +37,7 @@ class GsJob:
         self.cfg = cfg
         self.t0 = time.time()
         self.proc = None
+        self.hull_check = None
         res = camera_focus(dense_dir / "sparse" / "images.bin")
         if res is None:
             log.warning("카메라들이 한 대상을 향하지 않아 2DGS를 건너뜁니다.")
@@ -74,6 +77,10 @@ class GsJob:
             log.warning("2DGS 실패 (종료 코드 %d) → MVS 메쉬 사용. 로그: %s", code, self.out / "gs.log")
             return None
         res = json.loads(res_file.read_text(encoding="utf-8"))
+        self.hull_check = res.get("hull_check")
+        if res.get("rejected"):
+            log.warning("hull이 마스크와 어긋남 (%s) → MVS 메쉬 사용", res.get("hull_check"))
+            return None
         log.info("2DGS 완료 (총 %.1f초, MVS 이후 대기 %.1f초)", time.time() - self.t0, time.time() - t)
         return res
 
@@ -131,7 +138,8 @@ def fuse(gs_mesh: Path, mvs_mesh: Path, dst: Path, cfg: PipelineConfig,
     off = ((q[i] - v) * nrm).sum(1)
     agree = np.abs((qn[i] * nrm).sum(1)) > 0.5
     valid = (d < 0.03 * diag) & agree
-    f, _ = cg(sp.diags(valid.astype(float)) + cfg.fuse_lambda * lap + 1e-6 * sp.eye(n_v),
+    # 근거 없는 정점은 이동량 0으로 감쇠 (MVS 없는 막이 벌어지는 것 방지)
+    f, _ = cg(sp.diags(valid + FUSE_SCREEN * ~valid) + cfg.fuse_lambda * lap + 1e-6 * sp.eye(n_v),
               valid * off, maxiter=3000, rtol=1e-6)
     out = trimesh.Trimesh(v + f[:, None] * nrm, g.faces, process=False)
     trimesh.smoothing.filter_taubin(out, iterations=10)

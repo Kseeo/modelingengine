@@ -48,7 +48,6 @@ class PipelineConfig:
     seg_size: int = 1024
     seg_threshold: float = 0.3           # 깊이맵용 (넉넉하게)
     seg_dilate: float = 0.03             # 깊이맵용 팽창 (긴 변 대비)
-    seg_skin_filter: bool = True         # 마스크에서 비피부 물체(받침대·칸막이·바지) 제거
     seg_vote_ratio: float = 0.8          # 마스크 안 비율이 이 미만인 정점 제거 (0.9부터 발 표면 손실)
     seg_vote_min_views: int = 5          # 이보다 적게 보인 정점은 유지
     seg_vote_margin: int = 4             # 투표 마스크 경계 허용 (px)

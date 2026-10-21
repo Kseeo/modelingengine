@@ -95,42 +95,6 @@ def _undistort_map(src_cam, dst_cam):
     return cv2.initUndistortRectifyMap(kk, np.array(d, float), None, kn, (int(w), int(h)), cv2.CV_32FC1)
 
 
-def _skin_model(samples: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, float] | None:
-    """LAB 표본(N×3)들 → (a·b 평균, a·b 역공분산, 최소 밝기). 상위 80%만 남겨 반복 추정 (받침대·바지 영향 축소)."""
-    if not samples:
-        return None
-    x = np.concatenate(samples)
-    if len(x) < 500:
-        return None
-    ab = x[:, 1:]
-    keep = np.ones(len(ab), bool)
-    for _ in range(3):
-        mean = ab[keep].mean(0)
-        icov = np.linalg.inv(np.cov(ab[keep].T) + np.eye(2) * 1e-3)
-        d = np.einsum("ni,ij,nj->n", ab - mean, icov, ab - mean)
-        keep = d <= np.quantile(d, 0.8)
-    return mean, icov, 0.4 * float(np.median(x[keep, 0]))
-
-
-def _skin_region(lab: np.ndarray, mask: np.ndarray, model) -> np.ndarray | None:
-    """마스크 안 피부색 영역(큰 덩어리만, 경계 여유). 피부가 없으면 None."""
-    mean, icov, l_min = model
-    ab = lab[..., 1:] - mean
-    d = np.einsum("...i,ij,...j->...", ab, icov, ab)
-    skin = (mask & (d < 3.5 ** 2) & (lab[..., 0] >= l_min)).astype(np.uint8)
-    skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(skin)
-    if n <= 1:
-        return None
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    keep = np.isin(labels, 1 + np.nonzero(areas >= 0.05 * areas.max())[0])
-    # 피부로 둘러싸인 안쪽(그늘진 발바닥 등)은 복원: 제거 대상은 가장자리에 붙은 물체뿐
-    from scipy import ndimage
-
-    keep = ndimage.binary_fill_holes(keep).astype(np.uint8)
-    return cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
-
-
 def undistort_masks(raw_dir: Path, model_dir: Path, dense_dir: Path, out_dir: Path,
                     cfg: PipelineConfig) -> tuple[Path, Path] | None:
     """(깊이맵용 넉넉한 마스크, 투표용 마스크) 폴더. 깊이맵용은 OpenMVS 이름 규칙(<stem>.mask.png)."""
@@ -139,57 +103,17 @@ def undistort_masks(raw_dir: Path, model_dir: Path, dense_dir: Path, out_dir: Pa
     dst_cams = read_camera_models(dense_dir / "sparse" / "cameras.bin")
     loose_dir, vote_dir = fresh_dir(out_dir / "loose"), fresh_dir(out_dir / "vote")
     maps, ok, coverage = {}, 0, []
-    entries = read_images(dense_dir / "sparse" / "images.bin")
-    scale = 0.5  # 피부색 판정 해상도
-
-    def remap(name, cam_id):
+    for name, _, _, cam_id in read_images(dense_dir / "sparse" / "images.bin"):
+        _, w, h, _ = dst_cams[cam_id]
         raw = _read_mask(raw_dir / f"{name}.png")
         key = (src_img.get(name), cam_id)
         if raw is not None and key not in maps:
             maps[key] = _undistort_map(src_cams[key[0]], dst_cams[cam_id]) if key[0] in src_cams else None
         if raw is None or maps[key] is None:
-            return None
-        return cv2.remap(raw, *maps[key], cv2.INTER_LINEAR, borderValue=0)
-
-    def small_lab(name):
-        img = cv2.imdecode(np.fromfile(str(dense_dir / "images" / name), np.uint8), cv2.IMREAD_COLOR)
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        return cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-
-    model = None
-    if cfg.seg_skin_filter:
-        # 영상 전체 피부색: 마스크 안쪽 깊은 곳 표본 (프레임별 오분할에 덜 흔들림)
-        samples = []
-        for name, _, _, cam_id in entries[::max(1, len(entries) // 30)]:
-            prob = remap(name, cam_id)
-            if prob is None:
-                continue
-            lab = small_lab(name)
-            m = cv2.resize(prob, (lab.shape[1], lab.shape[0])) >= 128
-            core = cv2.erode(m.astype(np.uint8), np.ones((21, 21), np.uint8)) > 0
-            if core.sum() > 200:
-                samples.append(lab[core][:: max(1, int(core.sum()) // 2000)])
-        model = _skin_model(samples)
-    trimmed = []
-    for name, _, _, cam_id in entries:
-        _, w, h, _ = dst_cams[cam_id]
-        prob = remap(name, cam_id)
-        if prob is None:
             # 마스크 없음: 깊이맵은 제한 없음, 투표에서는 제외
             _write_png(loose_dir / f"{Path(name).stem}.mask.png", np.full((int(h), int(w)), 255, np.uint8))
             continue
-        if model is not None:
-            # 발에 붙은 비피부 물체(받침대·칸막이·바지) 제거. 60% 넘게 잘리면 판정 실패로 보고 유지
-            lab = small_lab(name)
-            m = cv2.resize(prob, (lab.shape[1], lab.shape[0])) >= 255 * cfg.seg_threshold
-            skin = _skin_region(lab, m, model)
-            if skin is not None:
-                keep = cv2.resize(skin.astype(np.uint8), (int(w), int(h)), interpolation=cv2.INTER_NEAREST) > 0
-                before = (prob >= 128).sum()
-                after = ((prob >= 128) & keep).sum()
-                if before and after >= 0.4 * before:
-                    prob = np.where(keep, prob, 0).astype(prob.dtype)
-                    trimmed.append(1 - after / before)
+        prob = cv2.remap(raw, *maps[key], cv2.INTER_LINEAR, borderValue=0)
         r = max(1, round(cfg.seg_dilate * max(w, h)))
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
         loose = cv2.dilate((prob >= 255 * cfg.seg_threshold).astype(np.uint8) * 255, kernel)
@@ -201,8 +125,6 @@ def undistort_masks(raw_dir: Path, model_dir: Path, dense_dir: Path, out_dir: Pa
         log.warning("분할 마스크를 왜곡 보정하지 못해 원형 마스크를 사용합니다.")
         return None
     log.info("분할 마스크 %d장 (깊이맵용 화면 평균 %.0f%% 영역)", ok, 100 * np.mean(coverage))
-    if trimmed:
-        log.info("비피부 영역 제거: %d장, 마스크 평균 %.1f%% 감소", len(trimmed), 100 * np.mean(trimmed))
     return loose_dir, vote_dir
 
 

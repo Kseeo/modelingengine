@@ -26,6 +26,8 @@ log = logging.getLogger("photogrammetry.gs")
 HULL_RES = 160
 HULL_RATIO = 0.8          # 화면 안 뷰 중 마스크 안 비율 (오분할 뷰에 강건)
 HULL_MIN_VIEWS = 5
+HULL_OFF_VIEW = 0.3       # hull 투영 중 마스크 밖 비율이 이보다 크면 어긋난 뷰
+HULL_OFF_MAX = 0.15       # 어긋난 뷰 비율 상한 (넘으면 hull 불신 → MVS만 사용)
 INIT_POINTS = 100_000
 TSDF_RES = 256
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
@@ -75,7 +77,19 @@ def run(job: dict) -> dict:
         # 오분할(사람·의자) 영역은 hull 투영 밖 → 학습 마스크에서 제외
         near_hull = F.max_pool2d(hull_cover.float()[:, None], 11, 1, 5)[:, 0] > 0.5
         train_masks = views.masks * near_hull
+        near_mask = F.max_pool2d(views.masks[:, None], 11, 1, 5)[:, 0] > 0.5
+        off = ((hull_cover & ~near_mask).sum((1, 2)) / hull_cover.sum((1, 2)).clamp(min=1)).cpu().numpy()
     hull.mesh.export(out / "hull.ply")  # 합성 단계에서 hull 덩어리 판별에 사용
+    hull_check = {"off_views": round(float((off > HULL_OFF_VIEW).mean()), 3),
+                  "off_median": round(float(np.median(off)), 3), "off_max": round(float(off.max()), 3)}
+    log.info("hull-마스크 불일치: 어긋난 뷰 %.0f%% (중앙값 %.2f, 최대 %.2f)",
+             100 * hull_check["off_views"], hull_check["off_median"], hull_check["off_max"])
+    if hull_check["off_views"] > HULL_OFF_MAX:
+        res = {"rejected": "hull", "hull_check": hull_check, "timings_sec": st.timings,
+               "total_sec": round(time.time() - t0, 1)}
+        (out / "result.json").write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.warning("hull이 마스크와 크게 어긋나 2DGS를 중단합니다.")
+        return res
 
     with st("priors"):
         normal_prior, prior_valid, prior_stats = priors.estimate(
@@ -99,7 +113,8 @@ def run(job: dict) -> dict:
 
     res = {"shape": str(out / "mesh.ply"), "hull": str(out / "hull.ply"), "hull_voxel": hull.voxel,
            "views": len(views), "faces": len(shape.faces), "timings_sec": st.timings, "vram_mb": st.vram,
-           "total_sec": round(time.time() - t0, 1), "train": stats, "priors": prior_stats}
+           "total_sec": round(time.time() - t0, 1), "train": stats, "priors": prior_stats,
+           "hull_check": hull_check}
     (out / "result.json").write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info("2DGS 완료 %.1fs: %s", res["total_sec"], st.timings)
     return res
