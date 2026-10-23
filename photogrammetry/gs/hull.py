@@ -76,6 +76,28 @@ def carve(views: Views, center: np.ndarray, radius: float, res: int, ratio: floa
     return Hull(occ, origin, voxel, mesh)
 
 
+def mask_recall(views: Views, hull: Hull, min_px: int = 50) -> np.ndarray:
+    """뷰별 마스크 중 hull 투영이 덮는 비율 (마스크가 작은 뷰는 1)."""
+    dev = views.images.device
+    pts = torch.from_numpy(hull.occ).to(dev).nonzero().float() * hull.voxel \
+        + torch.tensor(hull.origin, device=dev, dtype=torch.float32)
+    out = np.ones(len(views))
+    for i in range(len(views)):
+        m = views.masks[i] > 0.5
+        if m.sum() < min_px:
+            continue
+        xc = pts @ views.viewmats[i, :3, :3].T + views.viewmats[i, :3, 3]
+        uvw = xc @ views.Ks[i].T
+        u = (uvw[:, 0] / uvw[:, 2]).long()
+        v = (uvw[:, 1] / uvw[:, 2]).long()
+        ok = (uvw[:, 2] > 1e-6) & (u >= 0) & (u < views.width) & (v >= 0) & (v < views.height)
+        proj = torch.zeros(views.height, views.width, device=dev)
+        proj[v[ok], u[ok]] = 1
+        proj = F.max_pool2d(proj[None, None], 3, 1, 1)[0, 0] > 0
+        out[i] = float(proj[m].float().mean())
+    return out
+
+
 def surface_samples(hull: Hull, n: int, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
     """hull 표면 균등 샘플 (점, 바깥 노멀)."""
     pts, fidx = trimesh.sample.sample_surface_even(hull.mesh, n, seed=seed)

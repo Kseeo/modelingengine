@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from . import hull as hull_mod
 from . import mesh as mesh_mod
 from . import priors
-from .scene import load_views
+from .scene import Views, load_views
 from .train import TrainConfig, init_splats, train
 
 log = logging.getLogger("photogrammetry.gs")
@@ -28,9 +28,16 @@ HULL_RATIO = 0.8          # 화면 안 뷰 중 마스크 안 비율 (오분할 �
 HULL_MIN_VIEWS = 5
 HULL_OFF_VIEW = 0.3       # hull 투영 중 마스크 밖 비율이 이보다 크면 어긋난 뷰
 HULL_OFF_MAX = 0.15       # 어긋난 뷰 비율 상한 (넘으면 hull 불신 → MVS만 사용)
+HULL_BAD_RECALL = 0.3     # 마스크를 hull이 이보다 적게 덮으면 포즈 오류 뷰 → 제외
 INIT_POINTS = 100_000
 TSDF_RES = 256
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
+
+
+def _subset(views: Views, keep: np.ndarray) -> Views:
+    k = torch.from_numpy(np.nonzero(keep)[0]).to(views.images.device)
+    return Views([views.names[i] for i in k.tolist()], views.images[k], views.masks[k], views.Ks[k],
+                 views.viewmats[k], views.width, views.height)
 
 
 class StageLog:
@@ -70,6 +77,11 @@ def run(job: dict) -> dict:
 
     with st("hull"):
         hull = hull_mod.carve(views, center, radius, HULL_RES, HULL_RATIO, HULL_MIN_VIEWS)
+        bad = hull_mod.mask_recall(views, hull) < HULL_BAD_RECALL
+        if bad.any() and (~bad).sum() >= 10:
+            log.info("포즈 오류 뷰 %d장 제외 후 hull 재계산: %s", bad.sum(), [n for n, b in zip(views.names, bad) if b])
+            views = _subset(views, ~bad)
+            hull = hull_mod.carve(views, center, radius, HULL_RES, HULL_RATIO, HULL_MIN_VIEWS)
         pts, nrm = hull_mod.surface_samples(hull, INIT_POINTS)
         splats = init_splats(pts, nrm, hull.voxel * 0.7, views)
         hull_depth, hull_alpha = mesh_mod.render_depths(splats, views)
@@ -104,6 +116,9 @@ def run(job: dict) -> dict:
         del views
         torch.cuda.empty_cache()
         views = load_views(dense_dir, mask_dir, 0, job["image_size"])
+        good = hull_mod.mask_recall(views, hull) >= HULL_BAD_RECALL
+        if (~good).any() and good.sum() >= 10:
+            views = _subset(views, good)
         depths, alphas = mesh_mod.render_depths(splats, views)
         valid = (alphas > 0.5) & (F.max_pool2d(views.masks[:, None], 5, 1, 2)[:, 0] > 0.5)
         shape = mesh_mod.tsdf_mesh(depths, valid, views, center, radius, TSDF_RES, hull)
@@ -114,7 +129,7 @@ def run(job: dict) -> dict:
     res = {"shape": str(out / "mesh.ply"), "hull": str(out / "hull.ply"), "hull_voxel": hull.voxel,
            "views": len(views), "faces": len(shape.faces), "timings_sec": st.timings, "vram_mb": st.vram,
            "total_sec": round(time.time() - t0, 1), "train": stats, "priors": prior_stats,
-           "hull_check": hull_check}
+           "hull_check": hull_check, "bad_pose_views": int(bad.sum())}
     (out / "result.json").write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info("2DGS 완료 %.1fs: %s", res["total_sec"], st.timings)
     return res

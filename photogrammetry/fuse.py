@@ -26,6 +26,8 @@ from .tools import PROJECT_ROOT, fresh_dir
 log = logging.getLogger(__name__)
 
 FUSE_SCREEN = 0.05  # 근거 없는 정점 오프셋 감쇠 가중치
+MVS_NEAR = 0.03     # 2DGS에서 이 거리(대각 비율) 안의 MVS 점만 근거로 사용
+MVS_MIN_AGREE = 0.7 # MVS 점 중 근거 비율이 이 미만이면 MVS 불신 → 2DGS 단독
 
 
 
@@ -125,9 +127,19 @@ def fuse(gs_mesh: Path, mvs_mesh: Path, dst: Path, cfg: PipelineConfig,
     t0 = time.time()
     g = _largest_component(trimesh.load(gs_mesh, process=False, force="mesh"))  # 떨어진 조각 → 가시 방지
     m = trimesh.load(mvs_mesh, process=False, force="mesh")
-    diag = float(np.linalg.norm(m.extents))
+    diag = float(np.linalg.norm(g.extents))
     q, fid = trimesh.sample.sample_surface(m, 600_000)
     qn = m.face_normals[fid]
+    gs_pts, _ = trimesh.sample.sample_surface_even(g, 100_000, seed=0)
+    near = cKDTree(gs_pts).query(q, workers=-1)[0] < MVS_NEAR * diag
+    mvs_agree = float(near.mean())
+    if mvs_agree < MVS_MIN_AGREE:
+        log.warning("MVS가 2DGS와 크게 어긋남 (일치 %.0f%%) → 2DGS 단독 사용", 100 * mvs_agree)
+        g = _drop_spikes(g)
+        g.export(dst)
+        return dst, {"sec": round(time.time() - t0, 1), "mvs_agree": round(mvs_agree, 3), "skipped": "mvs_disagree",
+                     "faces": int(len(g.faces))}
+    q, qn = q[near], qn[near]  # 멀리 떨어진 MVS 판 조각 제외
     tree = cKDTree(q)
     a, lap = _adjacency(g)
     n_v = len(g.vertices)
@@ -167,7 +179,7 @@ def fuse(gs_mesh: Path, mvs_mesh: Path, dst: Path, cfg: PipelineConfig,
         trimesh.smoothing.filter_taubin(out, iterations=5)
     out = _drop_spikes(out)
     out.export(dst)
-    stats = {"sec": round(time.time() - t0, 1), "mvs_supported": round(float(sup.mean()), 3),
+    stats = {"sec": round(time.time() - t0, 1), "mvs_agree": round(mvs_agree, 3), "mvs_supported": round(float(sup.mean()), 3),
              "on_hull": round(float(on_hull.mean()), 3),
              "refilled": round(float(free.mean()), 3), "faces": int(len(out.faces))}
     log.info("합성: MVS 근거 %.0f%%, 재보간 %.0f%% (%d faces, %.1fs)", 100 * stats["mvs_supported"],
