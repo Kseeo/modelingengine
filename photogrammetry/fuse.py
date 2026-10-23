@@ -49,9 +49,12 @@ class GsJob:
         job_file = self.out / "job.json"
         job_file.write_text(json.dumps(job), encoding="utf-8")
         self.log_fh = open(self.out / "gs.log", "w", encoding="utf-8")
-        env = {**os.environ, "PYTHONPATH": str(PROJECT_ROOT)}
+        python = gpu_python(cfg)
+        # torch의 CUDA 확장 JIT 컴파일(ninja)이 python과 같은 env의 bin/에 있으므로 PATH에 추가.
+        env = {**os.environ, "PYTHONPATH": str(PROJECT_ROOT),
+               "PATH": f"{Path(python).parent}{os.pathsep}{os.environ.get('PATH', '')}"}
         try:
-            self.proc = subprocess.Popen([gpu_python(cfg), "-m", "photogrammetry.gs", str(job_file)],
+            self.proc = subprocess.Popen([python, "-m", "photogrammetry.gs", str(job_file)],
                                          cwd=PROJECT_ROOT, env=env, stdout=self.log_fh, stderr=subprocess.STDOUT)
             log.info("2DGS 시작 (백그라운드, MVS와 병렬)")
         except OSError as e:
