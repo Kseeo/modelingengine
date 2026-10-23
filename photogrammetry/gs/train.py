@@ -73,9 +73,12 @@ def init_splats(points: np.ndarray, normals: np.ndarray, spacing: float, views: 
 
 def render(splats, viewmats: torch.Tensor, Ks: torch.Tensor, width: int, height: int, **kw):
     """(rgb, alpha, normals, surf_normals, distort, median_depth, expected_depth, meta)."""
+    # gsplat 1.5.x의 RGB+ED 모드는 colors를 depths와 cat하기 전에 카메라(C) 축으로
+    # 브로드캐스트하지 않으므로, [N,3] 대신 [C,N,3]으로 직접 맞춰서 넘긴다.
+    colors = torch.sigmoid(splats["colors"])[None].expand(viewmats.shape[0], -1, -1)
     out = rasterization_2dgs(
         means=splats["means"], quats=splats["quats"], scales=torch.exp(splats["scales"]),
-        opacities=torch.sigmoid(splats["opacities"]), colors=torch.sigmoid(splats["colors"]),
+        opacities=torch.sigmoid(splats["opacities"]), colors=colors,
         viewmats=viewmats, Ks=Ks, width=width, height=height, render_mode="RGB+ED", **kw)
     colors, alphas, normals, surf_normals, distort, median, meta = out
     return colors[..., :3], alphas, normals, surf_normals, distort, median, colors[..., 3:], meta

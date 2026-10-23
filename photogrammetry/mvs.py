@@ -133,8 +133,8 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
     mesh = _output_mesh(mesh_scene, ".ply")
     if seg is not None:
         mesh = carve_by_masks(mesh, dense_dir / "sparse", seg[1], cfg, mvs / "scene_mesh_carve.ply")
-    if focus is not None:
-        # 최대 성분 선택 전에 배경 제거
+    elif focus is not None:
+        # 분할 마스크가 없을 때만 구체 자르기로 배경 제거 (마스크 투표가 더 정밀하므로 중복 자르기는 생략)
         mesh = crop_to_focus(mesh, focus, cfg.crop_radius_factor, mvs / "scene_mesh_crop.ply")
     if cfg.keep_largest_component:
         mesh = keep_largest_component(mesh, mvs / "scene_mesh_clean.ply")
