@@ -54,7 +54,7 @@ class PipelineConfig:
 
     # ---- Dense: 2DGS 마감 + MVS 곡률 합성 ----
     gpu_python: str = ""                 # 분할·2DGS용 (torch CUDA). 빈 값: PG_GPU_PYTHON 환경 변수
-    dense_method: str = "mvs"            # fused | mvs (fused는 느리고 2DGS 실패 시 자동으로 mvs 폴백)
+    dense_method: str = "fused"          # fused | mvs (MVS 단독은 구멍 발생 → fused로 2DGS 마감 보정, 실패 시 자동 mvs 폴백)
     gs_iters: int = 6000
     gs_max_views: int = 60               # 학습 뷰 수 (메쉬 융합은 전체 사용)
     gs_image_size: int = 960             # 학습 해상도 (긴 변)
