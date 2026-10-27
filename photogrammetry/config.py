@@ -1,6 +1,7 @@
 """파이프라인 설정값."""
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field, asdict
 
 QUALITY_PRESETS = {
@@ -79,7 +80,7 @@ class PipelineConfig:
     texture_resolution_level: int = 0
     texture_max_faces: int = 0           # 0 = 축소 안 함
     texture_smoothness: float = 0.1
-    texture_seam_leveling: bool = False  # Windows 빌드에서 텍스처 손상
+    texture_seam_leveling: bool = sys.platform != "win32"  # Windows 빌드에서만 텍스처 손상·크래시 → 그쪽만 기본 끔
     color_balance: bool = True           # 이미지별 노출·WB 보정 (SfM 트랙 기반, seam leveling 대체)
     max_threads: int = 0                 # 0 = 모든 코어
 
