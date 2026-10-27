@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 from pathlib import Path
 
 import cv2
@@ -13,7 +14,7 @@ from .config import PipelineConfig
 from .plyio import points_and_colors, read_vertex_ply, write_vertex_subset
 from .segment import carve_by_masks
 from .sfm import camera_focus, make_focus_masks
-from .tools import EXE, ToolError, run
+from .tools import EXE, Laps, ToolError, run
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,24 @@ def _ply_face_count(path: Path) -> int:
             if line.startswith(b"end_header"):
                 break
     return 0
+
+
+def _texture_masks(images_dir: Path, vote_dir: Path) -> None:
+    """TextureMesh용 마스크를 이미지 옆 <stem>.mask.png로 둔다 (0 = 배경). 마스크 없는 이미지는 전체 허용."""
+    import cv2
+    from PIL import Image
+
+    for img in images_dir.iterdir():
+        if img.name.endswith(".mask.png"):
+            continue
+        dst = images_dir / f"{img.stem}.mask.png"
+        src = vote_dir / f"{img.name}.png"
+        if src.is_file():
+            shutil.copyfile(src, dst)
+        else:
+            with Image.open(img) as im:
+                w, h = im.size
+            cv2.imencode(".png", np.full((h, w), 255, np.uint8))[1].tofile(str(dst))
 
 
 Focus = tuple[np.ndarray, float]  # (초점, 카메라-초점 거리)
@@ -127,9 +146,11 @@ def inpaint_empty_texture(obj_path: Path, tol: int = 24) -> None:
 
 def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
             depth_dir: Path | None = None, seg: tuple[Path, Path] | None = None,
-            mesh_hook=None) -> tuple[Path, Path]:
+            mesh_hook=None, laps: Laps | None = None) -> tuple[Path, Path]:
     """(텍스처 메쉬, 형상 메쉬) 반환. 형상 메쉬는 축소하지 않는다.
-    seg: (깊이맵용, 투표용) 분할 마스크 폴더. mesh_hook: 텍스처 전 메쉬 교체 (2DGS 합성)."""
+    seg: (깊이맵용, 투표용) 분할 마스크 폴더. mesh_hook: 텍스처 전 메쉬 교체 (2DGS 합성).
+    laps: 하위 단계 시간 기록."""
+    laps = laps or Laps()
     mvs = work / "mvs"
     mvs.mkdir(parents=True, exist_ok=True)
     logf = work / "openmvs.log"
@@ -142,6 +163,7 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
     scene = mvs / "scene.mvs"
     log.info("[MVS 1/5] COLMAP → OpenMVS 씬 변환")
     tool("InterfaceCOLMAP", "-i", depth_dir or dense_dir, "-o", scene, "--image-folder", dense_dir / "images")
+    laps.lap("interface")
 
     log.info("[MVS 2/5] 조밀 점군 생성 (깊이맵 추정 + 융합)")
     mask_args = []
@@ -167,6 +189,7 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
         log.warning("카메라들이 한 대상을 향하지 않아 초점 기준 자르기를 건너뜁니다.")
     if focus is not None:
         dense_ply = crop_points_to_focus(dense_ply, focus, cfg.crop_radius_factor, mvs / "scene_dense_crop.ply")
+    laps.lap("densify")
 
     log.info("[MVS 3/5] 표면 메쉬 복원 (Delaunay + graph-cut)")
     mesh_scene = mvs / "scene_mesh.mvs"
@@ -180,6 +203,7 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
         mesh = crop_to_focus(mesh, focus, cfg.crop_radius_factor, mvs / "scene_mesh_crop.ply")
     if cfg.keep_largest_component:
         mesh = keep_largest_component(mesh, mvs / "scene_mesh_clean.ply")
+    laps.lap("mesh")
 
     if cfg.refine_mesh:
         log.info("[MVS 4/5] 메쉬 정밀화 (광도 일관성 기반)")
@@ -190,10 +214,12 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
             mesh = _output_mesh(refine_scene, ".ply")
         except ToolError as e:
             log.warning("메쉬 정밀화 실패, 정밀화 전 메쉬를 사용합니다: %s", str(e).splitlines()[0])
+        laps.lap("refine")
     else:
         log.info("[MVS 4/5] 메쉬 정밀화 건너뜀")
     if mesh_hook is not None:
         mesh = mesh_hook(mesh)
+        laps.lap("mesh_hook")
 
     if not cfg.texture:
         log.info("[MVS 5/5] 텍스처 매핑 건너뜀")
@@ -205,15 +231,21 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
         decimate = cfg.texture_max_faces / faces
     log.info("[MVS 5/5] 텍스처 매핑 (%d faces%s)", faces,
              f" → {cfg.texture_max_faces} 로 축소" if decimate < 1 else "")
+    tex_mask = []
+    if seg is not None:
+        # 실루엣 근처 배경(바닥·벽)이 텍스처에 섞이지 않도록 투표용(팽창 없는) 마스크 밖 픽셀 제외
+        _texture_masks(dense_dir / "images", seg[1])
+        tex_mask = ["--ignore-mask-label", "0"]
     tex_input = dense_scene
-    if depth_dir is not None:
+    if depth_dir is not None or seg is not None:
+        # 전체 뷰 + 깊이맵용(팽창) 마스크가 없는 씬
         tex_input = mvs / "scene_all_views.mvs"
         tool("InterfaceCOLMAP", "-i", dense_dir, "-o", tex_input, "--image-folder", dense_dir / "images")
     tex_scene = mvs / "scene_texture.mvs"
     args = ["-i", tex_input, "-m", mesh, "-o", tex_scene,
             "--export-type", "obj", "--resolution-level", str(cfg.texture_resolution_level),
             "--decimate", f"{decimate:.4f}", "--cost-smoothness-ratio", str(cfg.texture_smoothness),
-            "--empty-color", str(_EMPTY_COLOR_INT)]
+            "--empty-color", str(_EMPTY_COLOR_INT), *tex_mask]
     # seam leveling은 Windows 빌드에서 텍스처 손상·크래시 → 실패 시 끄고 재시도
     seam = ["--global-seam-leveling", "1" if cfg.texture_seam_leveling else "0",
             "--local-seam-leveling", "1" if cfg.texture_seam_leveling else "0"]
@@ -222,10 +254,13 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
     for i, extra in enumerate(attempts):
         try:
             tool("TextureMesh", *args, *extra)
-            tex_obj = _output_mesh(tex_scene, ".obj")
-            inpaint_empty_texture(tex_obj)
-            return tex_obj, mesh
+            textured = _output_mesh(tex_scene, ".obj")
+            inpaint_empty_texture(textured)
+            break
         except ToolError as e:
             log.warning("텍스처 매핑 실패 (%d/%d): %s", i + 1, len(attempts), str(e).splitlines()[0])
-    log.warning("텍스처 매핑을 포기하고 형상만 출력합니다.")
-    return mesh, mesh
+    else:
+        log.warning("텍스처 매핑을 포기하고 형상만 출력합니다.")
+        textured = mesh
+    laps.lap("texture")
+    return textured, mesh

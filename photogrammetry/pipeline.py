@@ -11,13 +11,14 @@ import time
 from pathlib import Path
 
 from . import inputs
+from .color import balance_colors
 from .config import PipelineConfig
 from .export import export_models
 from .mvs import run_mvs
 from .fuse import GsJob, fuse
 from .segment import SegmentJob, undistort_masks
 from .sfm import run_sfm
-from .tools import find_colmap, find_openmvs_dir, fresh_dir
+from .tools import Laps, find_colmap, find_openmvs_dir, fresh_dir
 
 log = logging.getLogger(__name__)
 
@@ -76,26 +77,40 @@ def reconstruct(input_path: str | Path, output_dir: str | Path, name: str | None
     timings = {"input": round(time.time() - t0, 1)}
     log.info("=== [2/4] SfM: 카메라 포즈 추정 ===")
     seg = SegmentJob(images_dir, work / "seg_raw", cfg, work / "segment.log") if cfg.seg_masks else None
+    sfm_laps = Laps()
     try:
-        sfm = run_sfm(colmap, images_dir, work, cfg, single_camera, ordered=(kind == "video"))
+        sfm = run_sfm(colmap, images_dir, work, cfg, single_camera, ordered=(kind == "video"), laps=sfm_laps)
         seg_raw = seg.wait() if seg else None
+        sfm_laps.lap("seg_wait")  # SfM 이후 분할 대기
     except BaseException:
         if seg:
             seg.cancel()
         raise
 
     timings["sfm"] = round(time.time() - t0 - sum(timings.values()), 1)
-    seg_dirs = undistort_masks(seg_raw, sfm.model_dir, sfm.dense_dir, work / "seg", cfg) if seg_raw else None
+    mvs_laps = Laps()
+    color = None
+    if cfg.color_balance:
+        # 2DGS·MVS·텍스처가 같은 dense/images를 쓰므로 그 전에 보정
+        try:
+            color = balance_colors(sfm.dense_dir)
+        except Exception as e:  # noqa: BLE001
+            log.warning("색 보정 실패 → 원본 색 사용: %s", e)
+        mvs_laps.lap("color_balance")
+    seg_dirs =undistort_masks(seg_raw, sfm.model_dir, sfm.dense_dir, work / "seg", cfg) if seg_raw else None
     gs = None
     if cfg.dense_method == "fused":
         if seg_dirs is None:
             log.warning("분할 마스크가 없어 2DGS 합성을 건너뜁니다 (MVS만 사용).")
         else:
             gs = GsJob(sfm.dense_dir, seg_dirs[1], work, cfg)
+    mvs_laps.lap("seg_undistort")
     fusion = {"method": "mvs"}
 
     def fuse_hook(mvs_mesh: Path) -> Path:
+        t = time.time()
         res = gs.wait()
+        fusion["gs_wait_sec"] = round(time.time() - t, 1)  # MVS 이후 2DGS 대기 (임계 경로 판단용)
         if gs.hull_check:
             fusion["hull_check"] = gs.hull_check
         if res is None:
@@ -112,7 +127,7 @@ def reconstruct(input_path: str | Path, output_dir: str | Path, name: str | None
     log.info("=== [3/4] Dense: MVS%s + 메쉬 + 텍스처 ===", " ∥ 2DGS 합성" if gs else "")
     try:
         mesh_path, shape_path = run_mvs(openmvs, sfm.dense_dir, work, cfg, sfm.depth_dir, seg_dirs,
-                                        fuse_hook if gs else None)
+                                        fuse_hook if gs else None, laps=mvs_laps)
     finally:
         if gs:
             gs.cancel()
@@ -132,16 +147,19 @@ def reconstruct(input_path: str | Path, output_dir: str | Path, name: str | None
         "sparse_points": sfm.num_points,
         "up_aligned": sfm.aligned_up,
         "seg_masks": seg_raw is not None,
+        "color": color,
         "dense": fusion,
         "mesh": info,
         "units": "임의 단위 (SfM은 절대 스케일을 모름. --scale로 보정)" if cfg.scale == 1.0 else f"scale x{cfg.scale}",
         "workspace": str(work) if cfg.keep_workspace else None,
         "elapsed_sec": round(time.time() - t0, 1),
         "timings_sec": timings,
+        "timings_detail_sec": {"sfm": sfm_laps.as_dict(), "mvs": mvs_laps.as_dict()},
         "config": cfg.to_dict(),
     }
     (output_dir / f"{name}_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     if not cfg.keep_workspace:
         shutil.rmtree(work, ignore_errors=True)
+    log.info("단계별 시간: %s", report["timings_detail_sec"])
     log.info("완료 (%.1f분): %s", report["elapsed_sec"] / 60, ", ".join(info["files"].values()))
     return report

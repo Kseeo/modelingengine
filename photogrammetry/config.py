@@ -80,6 +80,7 @@ class PipelineConfig:
     texture_max_faces: int = 0           # 0 = 축소 안 함
     texture_smoothness: float = 0.1
     texture_seam_leveling: bool = False  # Windows 빌드에서 텍스처 손상
+    color_balance: bool = True           # 이미지별 노출·WB 보정 (SfM 트랙 기반, seam leveling 대체)
     max_threads: int = 0                 # 0 = 모든 코어
 
     # ---- 출력 ----

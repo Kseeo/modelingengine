@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from .config import PipelineConfig
-from .tools import ToolError, fresh_dir, run
+from .tools import Laps, ToolError, fresh_dir, run
 
 log = logging.getLogger(__name__)
 
@@ -52,9 +52,11 @@ def _qvec_to_rot(q) -> np.ndarray:
     ])
 
 
-def read_images(images_bin: Path) -> list[tuple[str, np.ndarray, np.ndarray, int]]:
-    """등록 이미지별 (파일명, R, t, camera_id). X_cam = R @ X_world + t."""
-    out = []
+_POINT2D = np.dtype([("x", "<f8"), ("y", "<f8"), ("id", "<i8")])
+
+
+def _iter_images(images_bin: Path, with_points: bool):
+    """(파일명, qvec, t, camera_id, 2D 관측 또는 None)."""
     with open(images_bin, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
         for _ in range(n):
@@ -66,9 +68,22 @@ def read_images(images_bin: Path) -> list[tuple[str, np.ndarray, np.ndarray, int
             while (ch := f.read(1)) != b"\0":
                 name += ch
             num_pts = struct.unpack("<Q", f.read(8))[0]
-            f.seek(24 * num_pts, 1)
-            out.append((name.decode("utf-8"), _qvec_to_rot(q), t, cam_id))
-    return out
+            if with_points:
+                pts = np.frombuffer(f.read(24 * num_pts), _POINT2D)
+            else:
+                f.seek(24 * num_pts, 1)
+                pts = None
+            yield name.decode("utf-8"), q, t, cam_id, pts
+
+
+def read_images(images_bin: Path) -> list[tuple[str, np.ndarray, np.ndarray, int]]:
+    """등록 이미지별 (파일명, R, t, camera_id). X_cam = R @ X_world + t."""
+    return [(name, _qvec_to_rot(q), t, cam_id) for name, q, t, cam_id, _ in _iter_images(images_bin, False)]
+
+
+def read_image_points(images_bin: Path) -> dict[str, np.ndarray]:
+    """이미지별 2D 관측 (x, y, id). 픽셀 좌상단 모서리가 (0, 0), 미삼각화 점은 id = -1."""
+    return {name: pts for name, _, _, _, pts in _iter_images(images_bin, True)}
 
 
 def read_image_names(images_bin: Path) -> list[str]:
@@ -192,8 +207,9 @@ def _poses_ok(model: Path | None, n_reg: int, num_input: int) -> bool:
 
 
 def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
-            single_camera: bool, ordered: bool = False) -> SfmResult:
-    """ordered: 파일명 순서 = 촬영 순서 (영상)."""
+            single_camera: bool, ordered: bool = False, laps: Laps | None = None) -> SfmResult:
+    """ordered: 파일명 순서 = 촬영 순서 (영상). laps: 하위 단계 시간 기록."""
+    laps = laps or Laps()
     bin_dir = colmap.parent
     logf = work / "colmap.log"
     db = work / "database.db"
@@ -232,6 +248,7 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
         gpu = "0"
         db.unlink(missing_ok=True)
         extract(gpu)
+    laps.lap("extract")
 
     if used_pairs:
         names = sorted(p.name for p in images_dir.iterdir())
@@ -249,6 +266,7 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
         log.info("[SfM 2/5] 특징점 매칭 (sequential, %d장)", num_input)
         colmap_run("sequential_matcher", "--database_path", db, "--FeatureMatching.use_gpu", gpu,
                    "--SequentialMatching.overlap", str(cfg.sequential_overlap))
+    laps.lap("match")
 
     def incremental(out: Path) -> tuple[Path, int]:
         fresh_dir(out)
@@ -295,11 +313,14 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
         if not used_pairs:
             raise
         model, n_reg = None, 0
+    laps.lap("map")
     if used_pairs and n_reg < 0.9 * num_input:
         # 끊긴 구간 연결: 남은 쌍 추가 매칭 후 재복원, 더 많이 등록된 쪽 사용
         log.warning("영상 쌍 매칭으로 %d / %d장만 등록 → 나머지 쌍을 추가 매칭 후 재복원", n_reg, num_input)
         colmap_run("exhaustive_matcher", "--database_path", db, "--FeatureMatching.use_gpu", gpu)
+        laps.lap("match_full")
         model2, n2 = map_sparse("sparse_full")
+        laps.lap("map_full")
         if n2 > n_reg:
             model, n_reg = model2, n2
     if model is None:
@@ -321,6 +342,7 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
             model, aligned = aligned_dir, True
         except ToolError as e:
             log.warning("방향 정렬 실패, 원래 좌표계를 사용합니다: %s", str(e).splitlines()[0])
+        laps.lap("align")
 
     log.info("[SfM 5/5] 이미지 왜곡 보정 (PINHOLE)")
     colmap_run("image_undistorter", "--image_path", images_dir, "--input_path", model,
@@ -343,6 +365,7 @@ def run_sfm(colmap: Path, images_dir: Path, work: Path, cfg: PipelineConfig,
                      len(reg), len(reg) - len(drop), cfg.mvs_view_stride, len(reg))
         else:
             log.info("등록 이미지가 적어 깊이맵에 전부 사용 (%d장)", len(reg))
+    laps.lap("undistort")
 
     n_pts = _count_bin(dense / "sparse" / "points3D.bin")
     log.info("희소 점군: %d points", n_pts)

@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from collections import deque
 from pathlib import Path
 
@@ -18,6 +19,22 @@ EXE = ".exe" if sys.platform == "win32" else ""
 
 class ToolError(RuntimeError):
     pass
+
+
+class Laps:
+    """구간별 경과 시간. lap(name): 직전 lap 이후 시간을 name에 누적."""
+
+    def __init__(self):
+        self.sec: dict[str, float] = {}
+        self._t = time.time()
+
+    def lap(self, name: str) -> None:
+        now = time.time()
+        self.sec[name] = self.sec.get(name, 0.0) + now - self._t
+        self._t = now
+
+    def as_dict(self) -> dict[str, float]:
+        return {k: round(v, 1) for k, v in self.sec.items()}
 
 
 def fresh_dir(path: Path) -> Path:
