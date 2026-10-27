@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from . import inputs
+from .color import balance_colors
 from .config import PipelineConfig
 from .export import export_models
 from .mvs import run_mvs
@@ -88,7 +89,15 @@ def reconstruct(input_path: str | Path, output_dir: str | Path, name: str | None
 
     timings["sfm"] = round(time.time() - t0 - sum(timings.values()), 1)
     mvs_laps = Laps()
-    seg_dirs = undistort_masks(seg_raw, sfm.model_dir, sfm.dense_dir, work / "seg", cfg) if seg_raw else None
+    color = None
+    if cfg.color_balance:
+        # 2DGS·MVS·텍스처가 같은 dense/images를 쓰므로 그 전에 보정
+        try:
+            color = balance_colors(sfm.dense_dir)
+        except Exception as e:  # noqa: BLE001
+            log.warning("색 보정 실패 → 원본 색 사용: %s", e)
+        mvs_laps.lap("color_balance")
+    seg_dirs =undistort_masks(seg_raw, sfm.model_dir, sfm.dense_dir, work / "seg", cfg) if seg_raw else None
     gs = None
     if cfg.dense_method == "fused":
         if seg_dirs is None:
@@ -138,6 +147,7 @@ def reconstruct(input_path: str | Path, output_dir: str | Path, name: str | None
         "sparse_points": sfm.num_points,
         "up_aligned": sfm.aligned_up,
         "seg_masks": seg_raw is not None,
+        "color": color,
         "dense": fusion,
         "mesh": info,
         "units": "임의 단위 (SfM은 절대 스케일을 모름. --scale로 보정)" if cfg.scale == 1.0 else f"scale x{cfg.scale}",

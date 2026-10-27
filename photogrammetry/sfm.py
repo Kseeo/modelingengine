@@ -52,9 +52,11 @@ def _qvec_to_rot(q) -> np.ndarray:
     ])
 
 
-def read_images(images_bin: Path) -> list[tuple[str, np.ndarray, np.ndarray, int]]:
-    """등록 이미지별 (파일명, R, t, camera_id). X_cam = R @ X_world + t."""
-    out = []
+_POINT2D = np.dtype([("x", "<f8"), ("y", "<f8"), ("id", "<i8")])
+
+
+def _iter_images(images_bin: Path, with_points: bool):
+    """(파일명, qvec, t, camera_id, 2D 관측 또는 None)."""
     with open(images_bin, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
         for _ in range(n):
@@ -66,9 +68,22 @@ def read_images(images_bin: Path) -> list[tuple[str, np.ndarray, np.ndarray, int
             while (ch := f.read(1)) != b"\0":
                 name += ch
             num_pts = struct.unpack("<Q", f.read(8))[0]
-            f.seek(24 * num_pts, 1)
-            out.append((name.decode("utf-8"), _qvec_to_rot(q), t, cam_id))
-    return out
+            if with_points:
+                pts = np.frombuffer(f.read(24 * num_pts), _POINT2D)
+            else:
+                f.seek(24 * num_pts, 1)
+                pts = None
+            yield name.decode("utf-8"), q, t, cam_id, pts
+
+
+def read_images(images_bin: Path) -> list[tuple[str, np.ndarray, np.ndarray, int]]:
+    """등록 이미지별 (파일명, R, t, camera_id). X_cam = R @ X_world + t."""
+    return [(name, _qvec_to_rot(q), t, cam_id) for name, q, t, cam_id, _ in _iter_images(images_bin, False)]
+
+
+def read_image_points(images_bin: Path) -> dict[str, np.ndarray]:
+    """이미지별 2D 관측 (x, y, id). 픽셀 좌상단 모서리가 (0, 0), 미삼각화 점은 id = -1."""
+    return {name: pts for name, _, _, _, pts in _iter_images(images_bin, True)}
 
 
 def read_image_names(images_bin: Path) -> list[str]:

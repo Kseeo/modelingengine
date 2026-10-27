@@ -9,6 +9,7 @@ MVS는 사진으로 직접 삼각측량해 **큰 곡률(아치·발등)**이 실
                                      ├─ [SfM · COLMAP] SIFT → 영상 쌍 매칭 → 초점거리 보정 → 전역 복원
 이미지 폴더(20장+) ──────────────────┘     (결과 부족 시 증분식과 비교) → 위쪽 정렬 → 왜곡 보정
             [분할 · BiRefNet, GPU]  SfM과 병렬로 프레임별 발 마스크
+            [색 보정] SfM 트랙의 다중 뷰 색 관측으로 이미지별 노출·화이트밸런스 gain 추정 → 보정
             [Dense]  OpenMVS(CPU) 깊이맵 → 메쉬  ∥  2DGS(GPU) hull 초기화 → 학습 → TSDF 메쉬
             [합성]   2DGS 메쉬에 MVS 큰 곡률 반영 → MVS 근거 없이 hull에 붙은 덩어리 재보간
                      → OpenMVS 텍스처 매핑
@@ -68,7 +69,8 @@ report = reconstruct("data/foot.mp4", "output/foot", config=PipelineConfig.prese
 - `<이름>.glb` — 텍스처 포함, glTF 규약 Y-up
 - `<이름>.stl` — 형상만, Z-up, 바닥이 z=0
 - `<이름>.ply` — STL과 같은 형상 + 정점 색
-- `<이름>_report.json` — 등록 이미지 수, 단계별 시간, 합성 통계(`dense`: MVS 근거·재보간 비율), 설정값
+- `<이름>_report.json` — 등록 이미지 수, 단계별 시간(`timings_detail_sec`), 색 보정 통계(`color`: 보정 배율 범위, 트랙 색 편차 전/후),
+  합성 통계(`dense`: MVS 근거·재보간 비율), 설정값
 
 작업 폴더(프레임, COLMAP DB, 모델, 로그)는 **성공하면 삭제, 실패하면 보존**합니다(`keep_workspace`).
 출력 경로에 한글·공백이 있으면 작업 폴더를 `%TEMP%\pg_work\` 아래에 만듭니다(`PG_WORK_ROOT`로 변경 가능).

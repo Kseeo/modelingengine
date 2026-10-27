@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,24 @@ def _ply_face_count(path: Path) -> int:
             if line.startswith(b"end_header"):
                 break
     return 0
+
+
+def _texture_masks(images_dir: Path, vote_dir: Path) -> None:
+    """TextureMesh용 마스크를 이미지 옆 <stem>.mask.png로 둔다 (0 = 배경). 마스크 없는 이미지는 전체 허용."""
+    import cv2
+    from PIL import Image
+
+    for img in images_dir.iterdir():
+        if img.name.endswith(".mask.png"):
+            continue
+        dst = images_dir / f"{img.stem}.mask.png"
+        src = vote_dir / f"{img.name}.png"
+        if src.is_file():
+            shutil.copyfile(src, dst)
+        else:
+            with Image.open(img) as im:
+                w, h = im.size
+            cv2.imencode(".png", np.full((h, w), 255, np.uint8))[1].tofile(str(dst))
 
 
 Focus = tuple[np.ndarray, float]  # (초점, 카메라-초점 거리)
@@ -170,14 +189,20 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
         decimate = cfg.texture_max_faces / faces
     log.info("[MVS 5/5] 텍스처 매핑 (%d faces%s)", faces,
              f" → {cfg.texture_max_faces} 로 축소" if decimate < 1 else "")
+    tex_mask = []
+    if seg is not None:
+        # 실루엣 근처 배경(바닥·벽)이 텍스처에 섞이지 않도록 투표용(팽창 없는) 마스크 밖 픽셀 제외
+        _texture_masks(dense_dir / "images", seg[1])
+        tex_mask = ["--ignore-mask-label", "0"]
     tex_input = dense_scene
-    if depth_dir is not None:
+    if depth_dir is not None or seg is not None:
+        # 전체 뷰 + 깊이맵용(팽창) 마스크가 없는 씬
         tex_input = mvs / "scene_all_views.mvs"
         tool("InterfaceCOLMAP", "-i", dense_dir, "-o", tex_input, "--image-folder", dense_dir / "images")
     tex_scene = mvs / "scene_texture.mvs"
     args = ["-i", tex_input, "-m", mesh, "-o", tex_scene,
             "--export-type", "obj", "--resolution-level", str(cfg.texture_resolution_level),
-            "--decimate", f"{decimate:.4f}", "--cost-smoothness-ratio", str(cfg.texture_smoothness)]
+            "--decimate", f"{decimate:.4f}", "--cost-smoothness-ratio", str(cfg.texture_smoothness), *tex_mask]
     # seam leveling은 Windows 빌드에서 텍스처 손상·크래시 → 실패 시 끄고 재시도
     seam = ["--global-seam-leveling", "1" if cfg.texture_seam_leveling else "0",
             "--local-seam-leveling", "1" if cfg.texture_seam_leveling else "0"]
