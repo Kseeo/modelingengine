@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
+import cv2
 import numpy as np
 import trimesh
 
@@ -14,6 +16,12 @@ from .sfm import camera_focus, make_focus_masks
 from .tools import EXE, ToolError, run
 
 log = logging.getLogger(__name__)
+
+# OpenMVS TextureMesh --empty-color 기본값 (0xFF7F27, 어느 뷰에도 안 보인 면을 채우는 색).
+# 뷰가 없는 면(주로 2DGS 합성으로 새로 생긴 구멍 메움 부분)이 그대로 주황색으로 튀어보이므로
+# 텍스처에서 이 색을 찾아 주변 색으로 인페인팅한다.
+_EMPTY_COLOR_BGR = (39, 127, 255)
+_EMPTY_COLOR_INT = 0xFF7F27
 
 
 def _output_mesh(mvs_file: Path, ext: str) -> Path:
@@ -81,6 +89,40 @@ def keep_largest_component(src: Path, dst: Path) -> Path:
     mesh.remove_unreferenced_vertices()
     mesh.export(dst)
     return dst
+
+
+def inpaint_empty_texture(obj_path: Path, tol: int = 24) -> None:
+    """텍스처에서 뷰가 없어 --empty-color로 채워진 부분을 주변 색으로 인페인팅한다.
+
+    UV 아틀라스의 미사용 배경(빈 패딩)도 같은 색이라 크기로는 "진짜 구멍"과 구분이 안 된다
+    (2DGS 합성 구멍은 작지 않을 수도 있음). 대신 패딩은 항상 이미지 테두리까지 이어진
+    하나의 연결 영역이라는 점을 이용 - 테두리에 닿은 성분만 배경으로 제외하고, 나머지
+    (차트 안쪽에 갇힌, 테두리에 안 닿는) 성분은 크기와 무관하게 전부 인페인팅한다.
+    """
+    mtl_path = obj_path.with_suffix(".mtl")
+    if not mtl_path.is_file():
+        return
+    images = [obj_path.parent / m.group(1) for m in re.finditer(r"^map_Kd\s+(.+)$", mtl_path.read_text(), re.MULTILINE)]
+    for img_path in images:
+        img = cv2.imread(str(img_path))
+        if img is None:
+            continue
+        dist = np.abs(img.astype(np.int16) - np.array(_EMPTY_COLOR_BGR, dtype=np.int16)).sum(axis=2)
+        raw_mask = (dist < tol).astype(np.uint8)
+        if raw_mask.sum() == 0:
+            continue
+        n, labels = cv2.connectedComponents(raw_mask, connectivity=8)
+        border_labels = set(labels[0, :]) | set(labels[-1, :]) | set(labels[:, 0]) | set(labels[:, -1])
+        border_labels.discard(0)
+        hole_labels = [i for i in range(1, n) if i not in border_labels]
+        if not hole_labels:
+            log.info("텍스처 인페인팅: %s - 빈 영역이 테두리까지 이어진 배경 패딩뿐이라 건너뜀", img_path.name)
+            continue
+        mask = np.isin(labels, hole_labels).astype(np.uint8)
+        log.info("텍스처 인페인팅: %s (%d개 구멍, %d픽셀, 전체의 %.1f%%)",
+                  img_path.name, len(hole_labels), mask.sum(), 100 * mask.mean())
+        filled = cv2.inpaint(img, mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+        cv2.imwrite(str(img_path), filled)
 
 
 def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
@@ -170,7 +212,8 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
     tex_scene = mvs / "scene_texture.mvs"
     args = ["-i", tex_input, "-m", mesh, "-o", tex_scene,
             "--export-type", "obj", "--resolution-level", str(cfg.texture_resolution_level),
-            "--decimate", f"{decimate:.4f}", "--cost-smoothness-ratio", str(cfg.texture_smoothness)]
+            "--decimate", f"{decimate:.4f}", "--cost-smoothness-ratio", str(cfg.texture_smoothness),
+            "--empty-color", str(_EMPTY_COLOR_INT)]
     # seam leveling은 Windows 빌드에서 텍스처 손상·크래시 → 실패 시 끄고 재시도
     seam = ["--global-seam-leveling", "1" if cfg.texture_seam_leveling else "0",
             "--local-seam-leveling", "1" if cfg.texture_seam_leveling else "0"]
@@ -179,7 +222,9 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
     for i, extra in enumerate(attempts):
         try:
             tool("TextureMesh", *args, *extra)
-            return _output_mesh(tex_scene, ".obj"), mesh
+            tex_obj = _output_mesh(tex_scene, ".obj")
+            inpaint_empty_texture(tex_obj)
+            return tex_obj, mesh
         except ToolError as e:
             log.warning("텍스처 매핑 실패 (%d/%d): %s", i + 1, len(attempts), str(e).splitlines()[0])
     log.warning("텍스처 매핑을 포기하고 형상만 출력합니다.")
