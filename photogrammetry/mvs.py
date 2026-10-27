@@ -11,7 +11,7 @@ from .config import PipelineConfig
 from .plyio import points_and_colors, read_vertex_ply, write_vertex_subset
 from .segment import carve_by_masks
 from .sfm import camera_focus, make_focus_masks
-from .tools import EXE, ToolError, run
+from .tools import EXE, Laps, ToolError, run
 
 log = logging.getLogger(__name__)
 
@@ -85,9 +85,11 @@ def keep_largest_component(src: Path, dst: Path) -> Path:
 
 def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
             depth_dir: Path | None = None, seg: tuple[Path, Path] | None = None,
-            mesh_hook=None) -> tuple[Path, Path]:
+            mesh_hook=None, laps: Laps | None = None) -> tuple[Path, Path]:
     """(텍스처 메쉬, 형상 메쉬) 반환. 형상 메쉬는 축소하지 않는다.
-    seg: (깊이맵용, 투표용) 분할 마스크 폴더. mesh_hook: 텍스처 전 메쉬 교체 (2DGS 합성)."""
+    seg: (깊이맵용, 투표용) 분할 마스크 폴더. mesh_hook: 텍스처 전 메쉬 교체 (2DGS 합성).
+    laps: 하위 단계 시간 기록."""
+    laps = laps or Laps()
     mvs = work / "mvs"
     mvs.mkdir(parents=True, exist_ok=True)
     logf = work / "openmvs.log"
@@ -100,6 +102,7 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
     scene = mvs / "scene.mvs"
     log.info("[MVS 1/5] COLMAP → OpenMVS 씬 변환")
     tool("InterfaceCOLMAP", "-i", depth_dir or dense_dir, "-o", scene, "--image-folder", dense_dir / "images")
+    laps.lap("interface")
 
     log.info("[MVS 2/5] 조밀 점군 생성 (깊이맵 추정 + 융합)")
     mask_args = []
@@ -125,6 +128,7 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
         log.warning("카메라들이 한 대상을 향하지 않아 초점 기준 자르기를 건너뜁니다.")
     if focus is not None:
         dense_ply = crop_points_to_focus(dense_ply, focus, cfg.crop_radius_factor, mvs / "scene_dense_crop.ply")
+    laps.lap("densify")
 
     log.info("[MVS 3/5] 표면 메쉬 복원 (Delaunay + graph-cut)")
     mesh_scene = mvs / "scene_mesh.mvs"
@@ -138,6 +142,7 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
         mesh = crop_to_focus(mesh, focus, cfg.crop_radius_factor, mvs / "scene_mesh_crop.ply")
     if cfg.keep_largest_component:
         mesh = keep_largest_component(mesh, mvs / "scene_mesh_clean.ply")
+    laps.lap("mesh")
 
     if cfg.refine_mesh:
         log.info("[MVS 4/5] 메쉬 정밀화 (광도 일관성 기반)")
@@ -148,10 +153,12 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
             mesh = _output_mesh(refine_scene, ".ply")
         except ToolError as e:
             log.warning("메쉬 정밀화 실패, 정밀화 전 메쉬를 사용합니다: %s", str(e).splitlines()[0])
+        laps.lap("refine")
     else:
         log.info("[MVS 4/5] 메쉬 정밀화 건너뜀")
     if mesh_hook is not None:
         mesh = mesh_hook(mesh)
+        laps.lap("mesh_hook")
 
     if not cfg.texture:
         log.info("[MVS 5/5] 텍스처 매핑 건너뜀")
@@ -179,8 +186,12 @@ def run_mvs(openmvs_dir: Path, dense_dir: Path, work: Path, cfg: PipelineConfig,
     for i, extra in enumerate(attempts):
         try:
             tool("TextureMesh", *args, *extra)
-            return _output_mesh(tex_scene, ".obj"), mesh
+            textured = _output_mesh(tex_scene, ".obj")
+            break
         except ToolError as e:
             log.warning("텍스처 매핑 실패 (%d/%d): %s", i + 1, len(attempts), str(e).splitlines()[0])
-    log.warning("텍스처 매핑을 포기하고 형상만 출력합니다.")
-    return mesh, mesh
+    else:
+        log.warning("텍스처 매핑을 포기하고 형상만 출력합니다.")
+        textured = mesh
+    laps.lap("texture")
+    return textured, mesh
